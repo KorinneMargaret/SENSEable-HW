@@ -27,17 +27,14 @@
 #define MQTT_USERNAME               "esp32_client"
 #define MQTT_PASSWORD               "pass1234"
 #define MQTT_DISCO_TOPIC            "usc/thesis/tenant-123/N001/disco" 
-
-// Set to 5 minutes (5 * 60 * 1000) for production, or lower (e.g., 30000) for testing
-#define DISCOVERY_INTERVAL_MS       (5 * 60 * 1000) 
-
+#define DISCOVERY_INTERVAL_MS       (10 * 1000) // 10s background sweep for fast hot-replug detection
 #define MQTT_TOPIC                  "usc/thesis/tenant-123/N001/tlm"
 #define MQTT_CMD_TOPIC              "usc/thesis/tenant-123/N001/cmd"
 
 static const char *TAG = "THESIS_NODE_N001";
 
 // ==========================================
-// 2. MOSQUITTO ROOT CA 
+// 2. MOSQUITTO ROOT CA
 // ==========================================
 static const char *mosqmq_root_ca =
 "-----BEGIN CERTIFICATE-----\n"
@@ -70,7 +67,9 @@ static const char *mosqmq_root_ca =
 #define REG_POINTER_CONFIG          0x01
 
 i2c_master_bus_handle_t bus_handle;
-i2c_master_dev_handle_t ads_handles[4];
+i2c_master_dev_handle_t ads_handles[4] = {NULL, NULL, NULL, NULL};
+const uint8_t possible_addresses[4] = {0x48, 0x49, 0x4A, 0x4B};
+
 uint8_t num_ads_found = 0;
 esp_mqtt_client_handle_t mqtt_client = NULL;
 
@@ -83,9 +82,13 @@ volatile bool is_mqtt_connected = false;
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT          BIT0
 
+static EventGroupHandle_t s_hardware_event_group;
+#define I2C_RESCAN_REQUIRED_BIT     BIT0
+
 typedef struct {
     uint8_t address;
     int16_t port_values[4];
+    bool is_online;
 } NodeData;
 
 NodeData global_node_data[4];
@@ -128,82 +131,46 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     if (event_id == MQTT_EVENT_CONNECTED) {
         ESP_LOGI(TAG, "SUCCESS! Secure TLS Connection to Mosquitto Established!");
         is_mqtt_connected = true;
-        
-        // Subscribe to the command topic upon successful connection
+        xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
         esp_mqtt_client_subscribe(client, MQTT_CMD_TOPIC, 1);
-        ESP_LOGI(TAG, "Listening for commands on: %s", MQTT_CMD_TOPIC);
-
     } else if (event_id == MQTT_EVENT_DISCONNECTED) {
         ESP_LOGW(TAG, "MQTT Broker Disconnected.");
         is_mqtt_connected = false;
-
     } else if (event_id == MQTT_EVENT_DATA) {
-        ESP_LOGI(TAG, "Command Received from Broker!");
-        
         char *json_string = malloc(event->data_len + 1);
         if (json_string) {
             memcpy(json_string, event->data, event->data_len);
             json_string[event->data_len] = '\0';
-            
             cJSON *root = cJSON_Parse(json_string);
             if (root) {
                 cJSON *port_item = cJSON_GetObjectItem(root, "port");
                 cJSON *state_item = cJSON_GetObjectItem(root, "state");
-
                 if (port_item && state_item && cJSON_IsNumber(port_item) && cJSON_IsBool(state_item)) {
                     int port_index = port_item->valueint;
-                    bool new_state = cJSON_IsTrue(state_item);
-                    
                     if (port_index >= 0 && port_index < 4) {
-                        port_active[port_index] = new_state;
-                        ESP_LOGW(TAG, ">>> HARDWARE UPDATE: Port %d state changed to %s <<<", 
-                                 port_index, new_state ? "ON" : "OFF");
+                        port_active[port_index] = cJSON_IsTrue(state_item);
                     }
-                } else {
-                    ESP_LOGE(TAG, "Invalid command payload format.");
                 }
                 cJSON_Delete(root);
             }
             free(json_string);
         }
-        
-    } else if (event_id == MQTT_EVENT_ERROR) {
-        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-            ESP_LOGE(TAG, "MQTT TLS/transport error. esp-tls err: 0x%x, tls stack: 0x%x",
-                     event->error_handle->esp_tls_last_esp_err,
-                     event->error_handle->esp_tls_stack_err);
-        }
     }
 }
 
 static void obtain_time(void) {
-    ESP_LOGI(TAG, "Initializing SNTP to get network time for TLS...");
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_init();
-
     int retry = 0;
-    const int retry_count = 15;
-    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
-        ESP_LOGI(TAG, "Waiting for system time to sync... (%d/%d)", retry, retry_count);
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < 15) {
         vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-
-    time_t now;
-    struct tm timeinfo;
-    time(&now);
-    localtime_r(&now, &timeinfo);
-    ESP_LOGI(TAG, "Time synced! Current Year: %d", (1900 + timeinfo.tm_year));
-
-    if ((1900 + timeinfo.tm_year) < 2024) {
-        ESP_LOGW(TAG, "Clock not synced — TLS cert validation will likely FAIL.");
     }
 }
 
 static void network_init(void) {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "NVS needs erase, reinitializing...");
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
@@ -214,7 +181,6 @@ static void network_init(void) {
     esp_netif_create_default_wifi_sta();
 
     s_wifi_event_group = xEventGroupCreate();
-
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
@@ -222,26 +188,15 @@ static void network_init(void) {
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
     wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-            .pmf_cfg = {
-                .capable = true,
-                .required = false,
-            },
-        },
+        .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS },
     };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Waiting for Wi-Fi / IP...");
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(20000));
-
     if (bits & WIFI_CONNECTED_BIT) {
         obtain_time();
-    } else {
-        ESP_LOGE(TAG, "No IP after 20s. Check the disconnect reason= logged above.");
     }
 
     esp_mqtt_client_config_t mqtt_cfg = {
@@ -257,48 +212,44 @@ static void network_init(void) {
 }
 
 // ==========================================
-// 5. HARDWARE I2C INITIALIZATION & SCANNING
+// 5. NON-DESTRUCTIVE SMART I2C SCANNING
 // ==========================================
 static void scan_i2c_bus(void) {
-    const uint8_t possible_addresses[] = {0x48, 0x49, 0x4A, 0x4B};
     uint8_t found_this_run = 0;
 
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        
-        for (int i = 0; i < num_ads_found; i++) {
-            if (ads_handles[i] != NULL) {
-                i2c_master_bus_rm_device(ads_handles[i]);
-                ads_handles[i] = NULL;
-            }
-        }
-
-        for (int i = 0; i < 4; i++) {
-            if (i2c_master_probe(bus_handle, possible_addresses[i], 100) == ESP_OK) {
-                i2c_device_config_t dev_cfg = {
-                    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-                    .device_address = possible_addresses[i],
-                    .scl_speed_hz = I2C_MASTER_FREQ_HZ,
-                };
+        if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
+            
+            for (int i = 0; i < 4; i++) {
+                esp_err_t probe_err = i2c_master_probe(bus_handle, possible_addresses[i], 100);
                 
-                if (i2c_master_bus_add_device(bus_handle, &dev_cfg, &ads_handles[found_this_run]) == ESP_OK) {
-                    if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
-                        global_node_data[found_this_run].address = possible_addresses[i];
-                        xSemaphoreGive(data_mutex);
+                if (probe_err == ESP_OK) {
+                    if (ads_handles[i] == NULL) {
+                        i2c_device_config_t dev_cfg = {
+                            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+                            .device_address = possible_addresses[i],
+                            .scl_speed_hz = I2C_MASTER_FREQ_HZ,
+                        };
+                        i2c_master_bus_add_device(bus_handle, &dev_cfg, &ads_handles[i]);
                     }
+                    global_node_data[i].address = possible_addresses[i];
+                    global_node_data[i].is_online = true;
                     found_this_run++;
+                } else {
+                    if (ads_handles[i] != NULL) {
+                        i2c_master_bus_rm_device(ads_handles[i]);
+                        ads_handles[i] = NULL;
+                    }
+                    global_node_data[i].address = possible_addresses[i];
+                    global_node_data[i].is_online = false;
+                    memset(global_node_data[i].port_values, 0, sizeof(global_node_data[i].port_values));
                 }
             }
-        }
-
-        if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
             num_ads_found = found_this_run;
             xSemaphoreGive(data_mutex);
         }
-
         xSemaphoreGive(i2c_mutex);
     }
-    
-    ESP_LOGI(TAG, "Active I2C Scan Complete. Online ADC Chips: %d", num_ads_found);
 }
 
 static esp_err_t i2c_master_init(void) {
@@ -314,32 +265,21 @@ static esp_err_t i2c_master_init(void) {
 }
 
 // ==========================================
-// 6. FREERTOS TASKS & EDGE EVALUATION
+// 6. FREERTOS WORKING TASKS
 // ==========================================
 static uint8_t evaluate_port_status(int16_t raw_value) {
-    const int16_t ADS_OVERFLOW_MAX = 32760; 
-    const int16_t ADS_OVERFLOW_MIN = -32760;
-    const int16_t ADS_DISCONNECTED_THRESHOLD = 5;
-
-    // Check if communication actually failed (-9999 is set by the reader task)
-    if (raw_value == -9999) {
-        return 3; // Code 3 = Physical chip connection failure / I2C Timeout
-    }
-    if (raw_value >= ADS_OVERFLOW_MAX || raw_value <= ADS_OVERFLOW_MIN) {
-        return 2; // Code 2 = Overflow / Saturation
-    }
-    if (raw_value >= -ADS_DISCONNECTED_THRESHOLD && raw_value <= ADS_DISCONNECTED_THRESHOLD) {
-        return 1; // Code 1 = Open Circuit / Floating
-    }
+    if (raw_value == -9999) return 3; 
+    if (raw_value >= 32760 || raw_value <= -32760) return 2; 
+    if (raw_value >= -5 && raw_value <= 5) return 1; 
     return 0; 
 }
 
 void ads_reader_task(void *pvParameter) {
     while (1) {
-        uint8_t local_chips_count = num_ads_found;
+        bool structural_drop_detected = false;
 
-        for (int chip_index = 0; chip_index < local_chips_count; chip_index++) {
-            if (ads_handles[chip_index] == NULL) continue;
+        for (int i = 0; i < 4; i++) {
+            if (ads_handles[i] == NULL) continue;
 
             for (int channel = 0; channel < 4; channel++) {
                 if (!port_active[channel]) continue;
@@ -355,39 +295,46 @@ void ads_reader_task(void *pvParameter) {
                 uint8_t reg_pointer = REG_POINTER_CONVERT;
                 uint8_t read_buf[2];
 
-                if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    // Send config with strict 100ms timeout
-                    esp_err_t tx_err = i2c_master_transmit(ads_handles[chip_index], config_data, sizeof(config_data), pdMS_TO_TICKS(100));
+                if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    esp_err_t tx_err = i2c_master_transmit(ads_handles[i], config_data, sizeof(config_data), -1);
                     xSemaphoreGive(i2c_mutex);
 
                     if (tx_err != ESP_OK) {
                         if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
-                            global_node_data[chip_index].port_values[channel] = -9999;
+                            global_node_data[i].port_values[channel] = -9999;
                             xSemaphoreGive(data_mutex);
                         }
+                        structural_drop_detected = true;
                         continue; 
                     }
 
                     vTaskDelay(pdMS_TO_TICKS(10));
 
-                    if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        // Receive data with strict 100ms timeout
-                        esp_err_t rx_err = i2c_master_transmit_receive(ads_handles[chip_index], &reg_pointer, 1, read_buf, sizeof(read_buf), pdMS_TO_TICKS(100));
+                    if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        esp_err_t rx_err = i2c_master_transmit_receive(ads_handles[i], &reg_pointer, 1, read_buf, sizeof(read_buf), -1);
                         xSemaphoreGive(i2c_mutex);
 
                         int16_t final_val = -9999;
                         if (rx_err == ESP_OK) {
                             final_val = (read_buf[0] << 8) | read_buf[1];
+                        } else {
+                            structural_drop_detected = true;
                         }
 
                         if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
-                            global_node_data[chip_index].port_values[channel] = final_val;
+                            global_node_data[i].port_values[channel] = final_val;
                             xSemaphoreGive(data_mutex);
                         }
                     }
                 }
             }
         }
+
+        if (structural_drop_detected) {
+            ESP_LOGW(TAG, "Hardware link drop caught! Signaling rescan...");
+            xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -395,8 +342,7 @@ void ads_reader_task(void *pvParameter) {
 void telemetry_builder_task(void *pvParameter) {
     while (1) {
         if (!is_mqtt_connected) {
-            ESP_LOGW(TAG, "Network down. Rechecking connection in 5s...");
-            vTaskDelay(pdMS_TO_TICKS(5000)); 
+            vTaskDelay(pdMS_TO_TICKS(2000)); 
             continue;
         }
 
@@ -410,22 +356,22 @@ void telemetry_builder_task(void *pvParameter) {
         cJSON *adc_array = cJSON_AddArrayToObject(root, "adc");
 
         if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
-            for (int chip = 0; chip < num_ads_found; chip++) {
-                cJSON *chip_obj = cJSON_CreateObject();
+            for (int i = 0; i < 4; i++) {
+                if (!global_node_data[i].is_online) continue;
 
+                cJSON *chip_obj = cJSON_CreateObject();
                 char hex_addr[5];
-                sprintf(hex_addr, "0x%02X", global_node_data[chip].address);
+                sprintf(hex_addr, "0x%02X", global_node_data[i].address);
                 cJSON_AddStringToObject(chip_obj, "a", hex_addr);
 
                 cJSON *ports_array = cJSON_AddArrayToObject(chip_obj, "p");
                 for (int channel = 0; channel < 4; channel++) {
                     if (port_active[channel]) {
-                        int16_t raw_reading = global_node_data[chip].port_values[channel];
+                        int16_t raw_reading = global_node_data[i].port_values[channel];
                         uint8_t current_status = evaluate_port_status(raw_reading);
 
                         int port_data[3] = {channel, raw_reading, current_status};
-                        cJSON *single_port_arr = cJSON_CreateIntArray(port_data, 3);
-                        cJSON_AddItemToArray(ports_array, single_port_arr);
+                        cJSON_AddItemToArray(ports_array, cJSON_CreateIntArray(port_data, 3));
                     }
                 }
                 cJSON_AddItemToArray(adc_array, chip_obj);
@@ -434,29 +380,62 @@ void telemetry_builder_task(void *pvParameter) {
         }
 
         char *payload_string = cJSON_PrintUnformatted(root);
+if (mqtt_client != NULL && payload_string != NULL) { // <-- Fixed: Publish regardless of raw count updates
+    esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload_string, 0, 1, 0);
+    ESP_LOGI(TAG, "Telemetry Payload Dispatched: %s", payload_string);
+}
+free(payload_string);
+cJSON_Delete(root);
 
-        if (mqtt_client != NULL && payload_string != NULL) {
-            int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload_string, 0, 1, 0);
-            if (msg_id != -1) {
-                ESP_LOGI(TAG, "Telemetry Sent to Mosquitto: %s", payload_string);
-            }
-        }
-
-        free(payload_string);
-        cJSON_Delete(root);
         
-        vTaskDelay(pdMS_TO_TICKS(10000));
+      vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
 
 void discovery_builder_task(void *pvParameter) {
+    // 0xFF forces a distinct initial mask state so boot discovery always publishes immediately
+    uint8_t last_topology = 0xFF; 
+
     while (1) {
         if (!is_mqtt_connected) {
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
 
+        EventBits_t bits = xEventGroupWaitBits(
+            s_hardware_event_group,
+            I2C_RESCAN_REQUIRED_BIT,
+            pdTRUE,
+            pdFALSE,
+            pdMS_TO_TICKS(DISCOVERY_INTERVAL_MS)
+        );
+
+        if (bits & I2C_RESCAN_REQUIRED_BIT) {
+            vTaskDelay(pdMS_TO_TICKS(200)); 
+        }
+
+        // Execution of non-destructive sweep
         scan_i2c_bus();
+
+        // Compute local topology bitmask string sequence internally
+        uint8_t current_topology = 0x00;
+        if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
+            for (int i = 0; i < 4; i++) {
+                if (global_node_data[i].is_online) {
+                    current_topology |= (1 << i);
+                }
+            }
+            xSemaphoreGive(data_mutex);
+        }
+
+        // ABORT TRANSMISSION FILTER CRITERIA: If identical, suppress packet publishing
+        if (current_topology == last_topology) {
+            ESP_LOGI(TAG, "Bus topology unchanged (Mask: 0x%02X). Suppressing duplicate database entry.", current_topology);
+            continue; 
+        }
+
+        // State has shifted! Record the new signature structure map configuration
+        last_topology = current_topology;
 
         cJSON *root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "t", "disco");
@@ -466,31 +445,25 @@ void discovery_builder_task(void *pvParameter) {
         cJSON_AddNumberToObject(root, "ts", (double)time(NULL));
 
         cJSON *bus_array = cJSON_AddArrayToObject(root, "buses");
-        
         if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
             cJSON_AddNumberToObject(root, "detected_chips", num_ads_found);
-            for (int chip = 0; chip < num_ads_found; chip++) {
-                char hex_addr[5];
-                sprintf(hex_addr, "0x%02X", global_node_data[chip].address);
-                cJSON_AddItemToArray(bus_array, cJSON_CreateString(hex_addr));
+            for (int i = 0; i < 4; i++) {
+                if (global_node_data[i].is_online) {
+                    char hex_addr[5];
+                    sprintf(hex_addr, "0x%02X", global_node_data[i].address);
+                    cJSON_AddItemToArray(bus_array, cJSON_CreateString(hex_addr));
+                }
             }
             xSemaphoreGive(data_mutex);
         }
 
         char *payload_string = cJSON_PrintUnformatted(root);
-
         if (mqtt_client != NULL && payload_string != NULL) {
-            int msg_id = esp_mqtt_client_publish(mqtt_client, "usc/thesis/tenant-123/N001/disco", payload_string, 0, 1, 1);
-            if (msg_id != -1) {
-                ESP_LOGW(TAG, ">>> Discovery Audit Dispatched: %s <<<", payload_string);
-            }
+            esp_mqtt_client_publish(mqtt_client, MQTT_DISCO_TOPIC, payload_string, 0, 1, 1);
+            ESP_LOGW(TAG, ">>> Topology Change Detected! Discovery Packet Dispatched: %s <<<", payload_string);
         }
-
         free(payload_string);
         cJSON_Delete(root);
-
-        // Fixed: The loop now correctly uses the macro defined at the top of the file
-        vTaskDelay(pdMS_TO_TICKS(DISCOVERY_INTERVAL_MS));
     }
 }
 
@@ -500,11 +473,10 @@ void discovery_builder_task(void *pvParameter) {
 void app_main(void) {
     i2c_mutex = xSemaphoreCreateMutex();
     data_mutex = xSemaphoreCreateMutex();
-
-    network_init();
+    s_hardware_event_group = xEventGroupCreate();
 
     if (i2c_master_init() != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize I2C master peripheral engine. Node halting.");
+        ESP_LOGE(TAG, "Failed to initialize I2C master peripheral engine.");
         vTaskSuspend(NULL);
     }
 
@@ -513,4 +485,6 @@ void app_main(void) {
     xTaskCreate(ads_reader_task, "unified_adc_worker", 3072, NULL, 5, NULL);
     xTaskCreate(telemetry_builder_task, "tlm_json_task", 4096, NULL, 5, NULL);
     xTaskCreate(discovery_builder_task, "disco_json_task", 4096, NULL, 5, NULL);
+
+    network_init();
 }
