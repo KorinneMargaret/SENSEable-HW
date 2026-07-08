@@ -1,3 +1,5 @@
+
+
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
@@ -13,6 +15,7 @@
 #include "nvs_flash.h"
 #include "mqtt_client.h"
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_sntp.h"
 #include "cJSON.h"
@@ -23,38 +26,41 @@
 #define WIFI_SSID                   "Hello"
 #define WIFI_PASS                   "oof000fo"
 
-#define MQTT_BROKER_URI             "mqtts://10.221.183.162:8883"
+#define MQTT_BROKER_URI             "mqtts://10.150.75.162:8883"
 #define MQTT_USERNAME               "esp32_client"
 #define MQTT_PASSWORD               "pass1234"
 #define MQTT_DISCO_TOPIC            "usc/thesis/tenant-123/N001/disco" 
-#define DISCOVERY_INTERVAL_MS       (10 * 1000) // 10s background sweep for fast hot-replug detection
+#define DISCOVERY_INTERVAL_MS       (10 * 1000) 
 #define MQTT_TOPIC                  "usc/thesis/tenant-123/N001/tlm"
 #define MQTT_CMD_TOPIC              "usc/thesis/tenant-123/N001/cmd"
 
 static const char *TAG = "THESIS_NODE_N001";
+
+#define FLOATING_LEAK_MIN   4500
+#define FLOATING_LEAK_MAX   5000
 
 // ==========================================
 // 2. MOSQUITTO ROOT CA
 // ==========================================
 static const char *mosqmq_root_ca =
 "-----BEGIN CERTIFICATE-----\n"
-"MIIDETCCAfmgAwIBAgIUJ3/2Kkv3DBx1B3fmVYoubmqup0IwDQYJKoZIhvcNAQEL\n"
-"BQAwGDEWMBQGA1UEAwwNTXlMb2NhbFJvb3RDQTAeFw0yNjA3MDMwNTUwNDVaFw0z\n"
-"NjA2MzAwNTUwNDVaMBgxFjAUBgNVBAMMDU15TG9jYWxSb290Q0EwggEiMA0GCSqG\n"
-"SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCmjljvodzXNgcVhaTYlPe7qtTTrr0FlpKB\n"
-"yC/zFWfYjdGkhOSinPZyoW6zOkB/rWZVNX3uexQ/Ok4VZ/xbxnaTX3Jzcf5vmSFs\n"
-"BsU3XHW7iyLTkyo0XuwIGTsyLuU1lWq+tU4rRDFiK5WChea0pZk1AHvJuUAgaGvP\n"
-"QJrp6VPX4HVXFYA5WNjfNlN11n0z/d/1CiHoHqQT4g7CAFXKGrpT3q+j41LnH3T4\n"
-"GKd2BtVAf0KfzFmKfz8ZI9hJ/edrxqQwg0HNImNGZGjDd5ZuPREOK0uNeAEhOQ/G\n"
-"RARuiOH8bCxYHeAV4MzyhcYaYzhV5LvFSJA4YxZGW2TKToIrvjRFAgMBAAGjUzBR\n"
-"MB0GA1UdDgQWBBSRGyEjp0NKUACwYjjwGVNTbYS+WzAfBgNVHSMEGDAWgBSRGyEj\n"
-"p0NKUACwYjjwGVNTbYS+WzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\n"
-"A4IBAQCWVZVa2INfpQxP/aZKh3JY036gLslcz2zthI1qODxt6s6kJjWNj05//Jip\n"
-"aFW5yI/TwywoJFo35s+thCsPciXT7vxjKPk/dzqAT4ChbQ7N5jx9IIzGruAKzSZY\n"
-"iMF55vbm/IzvLZC/JuEUdSXc/FHzesevFenywf5Yw3b4z36pYzZ9xTb1H74A4Ob5\n"
-"7xcRhk3pPWJAe2+aNwyLf/XvbxgCNFh9xIICJjiZnijskfxM2IUTkKjbu05bKnjs\n"
-"WYXVNPaE7n4+jH81eeF891k9cHQSQFIyiw90/tRnbe0ji2vth//JSsIemDdQjsOh\n"
-"UVrQTwBqG65RjKR3DAvmMkP1trgg\n"
+"MIIDETCCAfmgAwIBAgIUaEhYZb4ZmgJ2JBsKLXRLTaDE9h0wDQYJKoZIhvcNAQEL\n"
+"BQAwGDEWMBQGA1UEAwwNTXlMb2NhbFJvb3RDQTAeFw0yNjA3MDgwNzIxNDhaFw0z\n"
+"NjA3MDUwNzIxNDhaMBgxFjAUBgNVBAMMDU15TG9jYWxSb290Q0EwggEiMA0GCSqG\n"
+"SIb3DQEBAQUAA4IBDwAwggEKAoIBAQChg42Hhg1KgUaBF6RmBhJQQ05BTqee8V/r\n"
+"eKL38WGFUUw497fRYsOVEHzgCmNt/jCFUF/i1CsrLu1sZWDTLN8aZ/WzVpueMnF2\n"
+"AqAFXY9TGJiC63I2j3jhOYRiYLn/BeKeduGUDsEZUcGz805rKXtoiPPq4sZ1LIZb\n"
+"LjI1OGW7jdKbk8tlA2TEacNH5q9BQ8BQBjdvbApx73/k5st8Y688prJZ2H+FstPW\n"
+"x+mOM8yBz+bJ2efeAC+6KxDTDYLuR9QB3seIjQSat0NcL7vMKa8rTL3084CxHg1R\n"
+"nRrUZplccBMYSME2IYmJIH/aKznVO3d4AAvPgTBv9eVeG8e2rEI/AgMBAAGjUzBR\n"
+"MB0GA1UdDgQWBBSRxFIQkAFVqffJ/g+a/Jhr64HfczAfBgNVHSMEGDAWgBSRxFIQ\n"
+"kAFVqffJ/g+a/Jhr64HfczAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\n"
+"A4IBAQAmt3s2OgjjdKRO/itDKPTUJcK+mvMFfzfYpVG9qCUc7/2MRVkshiEKfPvj\n"
+"K6S+g8PTXF6kynIzT+nMQzAdjrcLnnMRoAVclXUin988O8u/mnMdsa9QAd85259S\n"
+"KVSyivI8faGVkBPqhCuuyHA06stQaE66mDyWU0qguKzsnc29Upqi3nfnUm8VPhaG\n"
+"c96TN9nl1AQgTAMQrd4xCI5KbKVcCEH4SROHf0MEaryqs5BMkAZRtG4h93pQZmSo\n"
+"ElJdYwZfWQpOQU3kOA03dgi73C+ZPGuEly0fWufIL1NKMpH1FyXK97PX8XFTeZdQ\n"
+"rkNBkkD58Tv6bXijFPJQxy3XDKDi\n"
 "-----END CERTIFICATE-----\n";
 
 // ==========================================
@@ -75,7 +81,14 @@ esp_mqtt_client_handle_t mqtt_client = NULL;
 
 SemaphoreHandle_t i2c_mutex;
 SemaphoreHandle_t data_mutex;
-bool port_active[4] = {true, false, true, false};
+
+// FIX 1: Two-dimensional array separating active tracks per chip and channel index
+bool port_active[4][4] = {
+    {true, true, true, true},   // Chip 0 (0x48)
+    {true, true, true, true},   // Chip 1 (0x49)
+    {true, true, true, true},   // Chip 2 (0x4A)
+    {true, true, true, true}    // Chip 3 (0x4B)
+};
 
 volatile bool is_mqtt_connected = false;
 
@@ -92,6 +105,60 @@ typedef struct {
 } NodeData;
 
 NodeData global_node_data[4];
+
+static esp_err_t i2c_master_init(void);
+
+// ==========================================
+// BIT-BANG I2C BUS RECOVERY ROUTINE
+// ==========================================
+static void recover_i2c_bus(void) {
+    ESP_LOGW(TAG, "Executing structured software bit-bang recovery routine...");
+
+    if (xSemaphoreTake(i2c_mutex, portMAX_DELAY) == pdTRUE) {
+        for (int i = 0; i < 4; i++) {
+            if (ads_handles[i] != NULL) {
+                i2c_master_bus_rm_device(ads_handles[i]);
+                ads_handles[i] = NULL;
+            }
+        }
+        if (bus_handle != NULL) {
+            i2c_del_master_bus(bus_handle);
+            bus_handle = NULL;
+        }
+
+        gpio_config_t bb_cfg = {
+            .pin_bit_mask = (1ULL << I2C_MASTER_SDA_IO) | (1ULL << I2C_MASTER_SCL_IO),
+            .mode = GPIO_MODE_INPUT_OUTPUT_OD, 
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE
+        };
+        gpio_config(&bb_cfg);
+
+        gpio_set_level(I2C_MASTER_SDA_IO, 1);
+        for (int i = 0; i < 9; i++) {
+            gpio_set_level(I2C_MASTER_SCL_IO, 0);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            gpio_set_level(I2C_MASTER_SCL_IO, 1);
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+
+        gpio_set_level(I2C_MASTER_SDA_IO, 0);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        gpio_set_level(I2C_MASTER_SCL_IO, 1);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        gpio_set_level(I2C_MASTER_SDA_IO, 1);
+        vTaskDelay(pdMS_TO_TICKS(5));
+
+        if (i2c_master_init() == ESP_OK) {
+            ESP_LOGI(TAG, "Hardware core I2C hardware bus engines linked after recovery routine execution.");
+        } else {
+            ESP_LOGE(TAG, "Fatal fault re-instantiating core hardware I2C master registers.");
+        }
+
+        xSemaphoreGive(i2c_mutex);
+    }
+}
 
 // ==========================================
 // 4. NETWORK, TIME & MQTT EVENT HANDLERS
@@ -143,12 +210,34 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             json_string[event->data_len] = '\0';
             cJSON *root = cJSON_Parse(json_string);
             if (root) {
-                cJSON *port_item = cJSON_GetObjectItem(root, "port");
-                cJSON *state_item = cJSON_GetObjectItem(root, "state");
-                if (port_item && state_item && cJSON_IsNumber(port_item) && cJSON_IsBool(state_item)) {
-                    int port_index = port_item->valueint;
-                    if (port_index >= 0 && port_index < 4) {
-                        port_active[port_index] = cJSON_IsTrue(state_item);
+                cJSON *act_item = cJSON_GetObjectItem(root, "action");
+                if (act_item && cJSON_IsString(act_item)) {
+                    const char *action = act_item->valuestring;
+                    
+                    if (strcmp(action, "bus_recovery") == 0) {
+                        recover_i2c_bus();
+                        xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+                    } 
+                    // FIX 2: Target single channel on single explicit chip index 
+                    else if (strcmp(action, "sensor_port_up") == 0 || strcmp(action, "sensor_port_down") == 0) {
+                        cJSON *chip_item = cJSON_GetObjectItem(root, "chip");
+                        cJSON *ch_item = cJSON_GetObjectItem(root, "ch");
+                        
+                        if (chip_item && ch_item && cJSON_IsNumber(chip_item) && cJSON_IsNumber(ch_item)) {
+                            int chip_idx = chip_item->valueint;
+                            int ch_idx = ch_item->valueint;
+                            
+                            if (chip_idx >= 0 && chip_idx < 4 && ch_idx >= 0 && ch_idx < 4) {
+                                bool set_active = (strcmp(action, "sensor_port_up") == 0);
+                                if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
+                                    port_active[chip_idx][ch_idx] = set_active;
+                                    xSemaphoreGive(data_mutex);
+                                }
+                                ESP_LOGW(TAG, "Altered configuration: Chip Index [%d] Port [%d] -> %s", 
+                                         chip_idx, ch_idx, set_active ? "ENABLED" : "DISABLED");
+                                xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+                            }
+                        }
                     }
                 }
                 cJSON_Delete(root);
@@ -204,7 +293,6 @@ static void network_init(void) {
         .credentials.username = MQTT_USERNAME,
         .credentials.authentication.password = MQTT_PASSWORD,
         .broker.verification.certificate = mosqmq_root_ca,
-        .broker.verification.skip_cert_common_name_check = true
     };
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -221,6 +309,7 @@ static void scan_i2c_bus(void) {
         if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
             
             for (int i = 0; i < 4; i++) {
+                if (bus_handle == NULL) break;
                 esp_err_t probe_err = i2c_master_probe(bus_handle, possible_addresses[i], 100);
                 
                 if (probe_err == ESP_OK) {
@@ -282,7 +371,8 @@ void ads_reader_task(void *pvParameter) {
             if (ads_handles[i] == NULL) continue;
 
             for (int channel = 0; channel < 4; channel++) {
-                if (!port_active[channel]) continue;
+                // Read from multi-dimensional index safety track mapping
+                if (!port_active[i][channel]) continue;
 
                 uint8_t config_msb;
                 switch (channel) {
@@ -296,7 +386,10 @@ void ads_reader_task(void *pvParameter) {
                 uint8_t read_buf[2];
 
                 if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    esp_err_t tx_err = i2c_master_transmit(ads_handles[i], config_data, sizeof(config_data), -1);
+                    esp_err_t tx_err = ESP_FAIL;
+                    if (ads_handles[i] != NULL) {
+                        tx_err = i2c_master_transmit(ads_handles[i], config_data, sizeof(config_data), -1);
+                    }
                     xSemaphoreGive(i2c_mutex);
 
                     if (tx_err != ESP_OK) {
@@ -311,7 +404,10 @@ void ads_reader_task(void *pvParameter) {
                     vTaskDelay(pdMS_TO_TICKS(10));
 
                     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                        esp_err_t rx_err = i2c_master_transmit_receive(ads_handles[i], &reg_pointer, 1, read_buf, sizeof(read_buf), -1);
+                        esp_err_t rx_err = ESP_FAIL;
+                        if (ads_handles[i] != NULL) {
+                            rx_err = i2c_master_transmit_receive(ads_handles[i], &reg_pointer, 1, read_buf, sizeof(read_buf), -1);
+                        }
                         xSemaphoreGive(i2c_mutex);
 
                         int16_t final_val = -9999;
@@ -331,7 +427,8 @@ void ads_reader_task(void *pvParameter) {
         }
 
         if (structural_drop_detected) {
-            ESP_LOGW(TAG, "Hardware link drop caught! Signaling rescan...");
+            ESP_LOGW(TAG, "Hardware link drop caught! Triggering inline bit-bang recovery routine...");
+            recover_i2c_bus();
             xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
         }
 
@@ -366,7 +463,7 @@ void telemetry_builder_task(void *pvParameter) {
 
                 cJSON *ports_array = cJSON_AddArrayToObject(chip_obj, "p");
                 for (int channel = 0; channel < 4; channel++) {
-                    if (port_active[channel]) {
+                    if (port_active[i][channel]) {
                         int16_t raw_reading = global_node_data[i].port_values[channel];
                         uint8_t current_status = evaluate_port_status(raw_reading);
 
@@ -380,21 +477,27 @@ void telemetry_builder_task(void *pvParameter) {
         }
 
         char *payload_string = cJSON_PrintUnformatted(root);
-if (mqtt_client != NULL && payload_string != NULL) { // <-- Fixed: Publish regardless of raw count updates
-    esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload_string, 0, 1, 0);
-    ESP_LOGI(TAG, "Telemetry Payload Dispatched: %s", payload_string);
-}
-free(payload_string);
-cJSON_Delete(root);
+        if (mqtt_client != NULL && payload_string != NULL) {
+            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload_string, 0, 1, 0);
+            ESP_LOGI(TAG, "Telemetry Payload Dispatched: %s", payload_string);
+        }
+        free(payload_string);
+        cJSON_Delete(root);
 
-        
-      vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
 
+static bool is_sensor_attached(int16_t raw_value) {
+    if (raw_value == -9999) return false; 
+    if (raw_value >= FLOATING_LEAK_MIN && raw_value <= FLOATING_LEAK_MAX) {
+        return false; 
+    }
+    return true; 
+}
+
 void discovery_builder_task(void *pvParameter) {
-    // 0xFF forces a distinct initial mask state so boot discovery always publishes immediately
-    uint8_t last_topology = 0xFF; 
+    uint32_t last_detailed_topology = 0xFFFFFFFF; 
 
     while (1) {
         if (!is_mqtt_connected) {
@@ -414,28 +517,38 @@ void discovery_builder_task(void *pvParameter) {
             vTaskDelay(pdMS_TO_TICKS(200)); 
         }
 
-        // Execution of non-destructive sweep
         scan_i2c_bus();
 
-        // Compute local topology bitmask string sequence internally
-        uint8_t current_topology = 0x00;
+        uint32_t current_detailed_topology = 0x00000000;
+        bool local_port_connected_map[4][4] = { {false} };
+
         if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
+            int bit_shift_index = 0;
             for (int i = 0; i < 4; i++) {
                 if (global_node_data[i].is_online) {
-                    current_topology |= (1 << i);
+                    current_detailed_topology |= (1 << bit_shift_index);
+                }
+                bit_shift_index++;
+
+                for (int channel = 0; channel < 4; channel++) {
+                    if (global_node_data[i].is_online && port_active[i][channel]) {
+                        bool attached = is_sensor_attached(global_node_data[i].port_values[channel]);
+                        local_port_connected_map[i][channel] = attached;
+                        
+                        if (attached) {
+                            current_detailed_topology |= (1 << bit_shift_index);
+                        }
+                    }
+                    bit_shift_index++;
                 }
             }
             xSemaphoreGive(data_mutex);
         }
 
-        // ABORT TRANSMISSION FILTER CRITERIA: If identical, suppress packet publishing
-        if (current_topology == last_topology) {
-            ESP_LOGI(TAG, "Bus topology unchanged (Mask: 0x%02X). Suppressing duplicate database entry.", current_topology);
+        if (current_detailed_topology == last_detailed_topology) {
             continue; 
         }
-
-        // State has shifted! Record the new signature structure map configuration
-        last_topology = current_topology;
+        last_detailed_topology = current_detailed_topology;
 
         cJSON *root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "t", "disco");
@@ -445,13 +558,30 @@ void discovery_builder_task(void *pvParameter) {
         cJSON_AddNumberToObject(root, "ts", (double)time(NULL));
 
         cJSON *bus_array = cJSON_AddArrayToObject(root, "buses");
+        
         if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
             cJSON_AddNumberToObject(root, "detected_chips", num_ads_found);
+            
             for (int i = 0; i < 4; i++) {
                 if (global_node_data[i].is_online) {
+                    cJSON *chip_obj = cJSON_CreateObject();
+                    
                     char hex_addr[5];
                     sprintf(hex_addr, "0x%02X", global_node_data[i].address);
-                    cJSON_AddItemToArray(bus_array, cJSON_CreateString(hex_addr));
+                    cJSON_AddStringToObject(chip_obj, "a", hex_addr);
+
+                    cJSON *ports_obj = cJSON_AddObjectToObject(chip_obj, "ports");
+                    for (int channel = 0; channel < 4; channel++) {
+                        char port_key[6];
+                        sprintf(port_key, "p%d", channel);
+                        
+                        if (port_active[i][channel]) {
+                            cJSON_AddStringToObject(ports_obj, port_key, local_port_connected_map[i][channel] ? "CONNECTED" : "DISCONNECTED");
+                        } else {
+                            cJSON_AddStringToObject(ports_obj, port_key, "DISABLED");
+                        }
+                    }
+                    cJSON_AddItemToArray(bus_array, chip_obj);
                 }
             }
             xSemaphoreGive(data_mutex);
@@ -460,7 +590,7 @@ void discovery_builder_task(void *pvParameter) {
         char *payload_string = cJSON_PrintUnformatted(root);
         if (mqtt_client != NULL && payload_string != NULL) {
             esp_mqtt_client_publish(mqtt_client, MQTT_DISCO_TOPIC, payload_string, 0, 1, 1);
-            ESP_LOGW(TAG, ">>> Topology Change Detected! Discovery Packet Dispatched: %s <<<", payload_string);
+            ESP_LOGW(TAG, "Discovery Signed Signature Dispatched: %s", payload_string);
         }
         free(payload_string);
         cJSON_Delete(root);
@@ -488,3 +618,5 @@ void app_main(void) {
 
     network_init();
 }
+
+
