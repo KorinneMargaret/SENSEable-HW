@@ -1,5 +1,4 @@
 
-
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
@@ -26,7 +25,7 @@
 #define WIFI_SSID                   "Hello"
 #define WIFI_PASS                   "oof000fo"
 
-#define MQTT_BROKER_URI             "mqtts://10.150.75.162:8883"
+#define MQTT_BROKER_URI             "mqtts://10.150.75.37:8883"
 #define MQTT_USERNAME               "esp32_client"
 #define MQTT_PASSWORD               "pass1234"
 #define MQTT_DISCO_TOPIC            "usc/thesis/tenant-123/N001/disco" 
@@ -36,31 +35,31 @@
 
 static const char *TAG = "THESIS_NODE_N001";
 
-#define FLOATING_LEAK_MIN   4500
-#define FLOATING_LEAK_MAX   5000
+#define FLOATING_LEAK_MIN   500
+#define FLOATING_LEAK_MAX   5500
 
 // ==========================================
 // 2. MOSQUITTO ROOT CA
 // ==========================================
 static const char *mosqmq_root_ca =
 "-----BEGIN CERTIFICATE-----\n"
-"MIIDETCCAfmgAwIBAgIUaEhYZb4ZmgJ2JBsKLXRLTaDE9h0wDQYJKoZIhvcNAQEL\n"
-"BQAwGDEWMBQGA1UEAwwNTXlMb2NhbFJvb3RDQTAeFw0yNjA3MDgwNzIxNDhaFw0z\n"
-"NjA3MDUwNzIxNDhaMBgxFjAUBgNVBAMMDU15TG9jYWxSb290Q0EwggEiMA0GCSqG\n"
-"SIb3DQEBAQUAA4IBDwAwggEKAoIBAQChg42Hhg1KgUaBF6RmBhJQQ05BTqee8V/r\n"
-"eKL38WGFUUw497fRYsOVEHzgCmNt/jCFUF/i1CsrLu1sZWDTLN8aZ/WzVpueMnF2\n"
-"AqAFXY9TGJiC63I2j3jhOYRiYLn/BeKeduGUDsEZUcGz805rKXtoiPPq4sZ1LIZb\n"
-"LjI1OGW7jdKbk8tlA2TEacNH5q9BQ8BQBjdvbApx73/k5st8Y688prJZ2H+FstPW\n"
-"x+mOM8yBz+bJ2efeAC+6KxDTDYLuR9QB3seIjQSat0NcL7vMKa8rTL3084CxHg1R\n"
-"nRrUZplccBMYSME2IYmJIH/aKznVO3d4AAvPgTBv9eVeG8e2rEI/AgMBAAGjUzBR\n"
-"MB0GA1UdDgQWBBSRxFIQkAFVqffJ/g+a/Jhr64HfczAfBgNVHSMEGDAWgBSRxFIQ\n"
-"kAFVqffJ/g+a/Jhr64HfczAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\n"
-"A4IBAQAmt3s2OgjjdKRO/itDKPTUJcK+mvMFfzfYpVG9qCUc7/2MRVkshiEKfPvj\n"
-"K6S+g8PTXF6kynIzT+nMQzAdjrcLnnMRoAVclXUin988O8u/mnMdsa9QAd85259S\n"
-"KVSyivI8faGVkBPqhCuuyHA06stQaE66mDyWU0qguKzsnc29Upqi3nfnUm8VPhaG\n"
-"c96TN9nl1AQgTAMQrd4xCI5KbKVcCEH4SROHf0MEaryqs5BMkAZRtG4h93pQZmSo\n"
-"ElJdYwZfWQpOQU3kOA03dgi73C+ZPGuEly0fWufIL1NKMpH1FyXK97PX8XFTeZdQ\n"
-"rkNBkkD58Tv6bXijFPJQxy3XDKDi\n"
+"MIIDETCCAfmgAwIBAgIUdfh3X75hQXfqzMhCZ8Z5Wue0YjgwDQYJKoZIhvcNAQEL\n"
+"BQAwGDEWMBQGA1UEAwwNTXlMb2NhbFJvb3RDQTAeFw0yNjA3MDkwNjE5MDhaFw0z\n"
+"NjA3MDYwNjE5MDhaMBgxFjAUBgNVBAMMDU15TG9jYWxSb290Q0EwggEiMA0GCSqG\n"
+"SIb3DQEBAQUAA4IBDwAwggEKAoIBAQC8qN5tzuFIt1uLHafGIuOPjyfNC41X2S8+\n"
+"cnWB1azB2jaYzwvHTarFXpjow2QAO0SU3G32LUQ0p3BNpHvLaASp8BC83Y4hW0jY\n"
+"UG/LpB6rozJRq0SmsJHpZBkGngsvDbbOlUdLG7PPH46Ln6KwbIufX845IKLyv/5S\n"
+"JhpbM9lsYLrao92Pz7zLqxwOUbCo2Jk/n+aqn4k8FgkylMBgWBGr5FxUcWcbBjPJ\n"
+"QoWk/RHGjvLvMvR1WWSANZfgOdgYGq2EHecmNHgKhDEL5cms/2GfQhW+/QX72T8y\n"
+"B0RgMtXuNsPuDjrFSy6d3yVEwPflH5hGo8BopSl7A3S7MWkxxU33AgMBAAGjUzBR\n"
+"MB0GA1UdDgQWBBRvv8r3L6s77MObyzUYa4T2mWsOmDAfBgNVHSMEGDAWgBRvv8r3\n"
+"L6s77MObyzUYa4T2mWsOmDAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\n"
+"A4IBAQA+t3u0WWZHL22L6Vd/fP047S0Zth9v/SRCyKs6LYOIsrGctxROjtm1BOin\n"
+"cNRWToqUUGFB0ANz7fG9Bx3QgqLND2NYOQ4LdtdYyaHMqTstH0QuTnIin9Xhb2bw\n"
+"HHIA+bzsdWyIFBdiiKNvNLB1K4O7fiSWBzTqMK4thkcwVRGo9K6GmmIq7UuzOuw4\n"
+"P2GrlAJCvicxQGgt1/3XUCg3NNh8q3CMLrrW7vOdcerhWIc8efuynhU8wqZ02bbj\n"
+"6EYq4YNLJL23CPurALGOmbBRlcBbfn8acdFimqWdK1dOyBKNSirmPQh6i9tTDzBA\n"
+"Zdz9wAJqi9P4AlR3sQU/TmhbPkb9\n"
 "-----END CERTIFICATE-----\n";
 
 // ==========================================
@@ -497,6 +496,7 @@ static bool is_sensor_attached(int16_t raw_value) {
 }
 
 void discovery_builder_task(void *pvParameter) {
+    // Initialize with an impossible signature state to force an initial broadcast on boot
     uint32_t last_detailed_topology = 0xFFFFFFFF; 
 
     while (1) {
@@ -505,18 +505,20 @@ void discovery_builder_task(void *pvParameter) {
             continue;
         }
 
+        // Wait for an on-demand rescan event or timeout interval (10 seconds)
         EventBits_t bits = xEventGroupWaitBits(
             s_hardware_event_group,
             I2C_RESCAN_REQUIRED_BIT,
-            pdTRUE,
+            pdTRUE, // Clear the bit after reading
             pdFALSE,
             pdMS_TO_TICKS(DISCOVERY_INTERVAL_MS)
         );
 
         if (bits & I2C_RESCAN_REQUIRED_BIT) {
-            vTaskDelay(pdMS_TO_TICKS(200)); 
+            vTaskDelay(pdMS_TO_TICKS(200)); // Allow bus voltages to settle after recovery actions
         }
 
+        // Perform a fresh hardware sweep
         scan_i2c_bus();
 
         uint32_t current_detailed_topology = 0x00000000;
@@ -524,12 +526,15 @@ void discovery_builder_task(void *pvParameter) {
 
         if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
             int bit_shift_index = 0;
+            
             for (int i = 0; i < 4; i++) {
+                // 1. Map Chip Online Status (Bits 0-3)
                 if (global_node_data[i].is_online) {
                     current_detailed_topology |= (1 << bit_shift_index);
                 }
                 bit_shift_index++;
 
+                // 2. Map Port Attachment Status (Bits 4-19)
                 for (int channel = 0; channel < 4; channel++) {
                     if (global_node_data[i].is_online && port_active[i][channel]) {
                         bool attached = is_sensor_attached(global_node_data[i].port_values[channel]);
@@ -545,11 +550,19 @@ void discovery_builder_task(void *pvParameter) {
             xSemaphoreGive(data_mutex);
         }
 
+        // =====================================================================
+        // RESTORED: DUPLICATE ENTRY SUPPRESSION GUARD
+        // =====================================================================
         if (current_detailed_topology == last_detailed_topology) {
+            // Bus configuration and sensor attachments match the previous cycle perfectly.
+            // Suppress transmission to save network bandwidth and processing cycles.
             continue; 
         }
+        
+        // Update the reference snapshot for the next evaluation cycle
         last_detailed_topology = current_detailed_topology;
 
+        // Create and serialize JSON payload since a structural change was detected
         cJSON *root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "t", "disco");
         cJSON_AddNumberToObject(root, "v", 1);
@@ -589,8 +602,9 @@ void discovery_builder_task(void *pvParameter) {
 
         char *payload_string = cJSON_PrintUnformatted(root);
         if (mqtt_client != NULL && payload_string != NULL) {
+            // Sent with MQTT Retain = 1 so the broker caches the latest valid topology signature
             esp_mqtt_client_publish(mqtt_client, MQTT_DISCO_TOPIC, payload_string, 0, 1, 1);
-            ESP_LOGW(TAG, "Discovery Signed Signature Dispatched: %s", payload_string);
+            ESP_LOGW(TAG, "Topology Change Caught! New Discovery Packet Dispatched: %s", payload_string);
         }
         free(payload_string);
         cJSON_Delete(root);
@@ -618,5 +632,4 @@ void app_main(void) {
 
     network_init();
 }
-
 
