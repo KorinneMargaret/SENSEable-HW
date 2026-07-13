@@ -7,7 +7,7 @@ import paho.mqtt.client as mqtt
 # ==============================================================================
 # CONFIGURATION (Updated Credentials)
 # ==============================================================================
-MQTT_HOST = "10.150.75.37"  # Updated to recent broker address
+MQTT_HOST = "10.66.206.162"  # Updated to recent broker address
 MQTT_PORT = 8883
 MQTT_USER = "admin_user"
 MQTT_PASS = "adminpass1234"

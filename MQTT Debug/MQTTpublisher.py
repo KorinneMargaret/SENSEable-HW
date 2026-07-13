@@ -5,7 +5,7 @@ import time
 import uuid
 import paho.mqtt.client as mqtt
 
-MQTT_HOST = "10.150.75.37"
+MQTT_HOST = "10.66.206.162"
 MQTT_PORT = 8883
 MQTT_USER = "admin_user"
 MQTT_PASS = "adminpass1234"
@@ -40,34 +40,44 @@ def interactive_menu() -> dict:
 
     elif choice == "2":
         payload = build_base_payload("actuate")
-        port_num = input("Target Physical Output Channel Number (1-16): OUT").strip()
         try:
-            p_val = int(port_num)
-            if p_val < 1 or p_val > 16: raise ValueError()
-            payload["port"] = f"OUT{p_val}"
-        except ValueError:
-            print("[INPUT ERROR] Output port channel must be between 1 and 16."); return None
+            # UPDATED: Allows mapping to all 6 physical ESP32 actuators
+            p_val = int(input("Target Physical Output Channel (1-6): OUT").strip())
+            if p_val < 1 or p_val > 6: 
+                raise ValueError("Firmware currently supports actuators OUT1 through OUT6.")
+            payload["port"] = p_val 
+        except ValueError as e:
+            print(f"[INPUT ERROR] {e}")
+            return None
 
-        mode = input("Select Driver Signal Mode ('bin' or 'pwm'): ").strip().lower()
-        if mode not in ["bin", "pwm"]: return None
+        mode = input("Select Driver Signal Mode ('bin' for Relay/Switch, 'pwm' for Motor/LED): ").strip().lower()
+        if mode not in ["bin", "pwm"]: 
+            print("[INPUT ERROR] Mode must be exactly 'bin' or 'pwm'.")
+            return None
         payload["mode"] = mode
 
         if mode == "bin":
             state = input("Set Logic Condition (0 for OFF, 1 for ON): ").strip()
-            if state not in ["0", "1"]: return None
+            if state not in ["0", "1"]: 
+                return None
             payload["state"] = int(state)
         else:
             try:
-                duty = int(input("Set 8-bit LEDC PWM Duty Resolution Value (0-255): ").strip())
-                if duty < 0 or duty > 255: raise ValueError()
+                duty = int(input("Set 8-bit PWM Duty Cycle (0 = Off, 128 = 50%, 255 = 100%): ").strip())
+                if duty < 0 or duty > 255: 
+                    raise ValueError("PWM Duty must be an integer between 0 and 255.")
                 payload["duty"] = duty
-            except ValueError: return None
+            except ValueError as e:
+                print(f"[INPUT ERROR] {e}")
+                return None
 
         try:
-            dur = int(input("Execution Window Timeout in Milliseconds (0 for Indefinite): ").strip())
+            dur = int(input("Execution Window Timeout in Milliseconds (0 for Indefinite hold): ").strip())
             if dur < 0: raise ValueError()
             payload["dur"] = dur
-        except ValueError: return None
+        except ValueError: 
+            return None
+            
         return payload
 
     elif choice == "3":
@@ -86,6 +96,7 @@ def interactive_menu() -> dict:
             return payload
         except ValueError as e:
             print(f"[INPUT ERROR] {e}"); return None
+            
     return None
 
 def main():
@@ -120,3 +131,5 @@ def main():
         client.loop_stop(); client.disconnect()
 
 if __name__ == "__main__": main()
+
+
