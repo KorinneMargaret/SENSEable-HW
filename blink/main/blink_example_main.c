@@ -1,6 +1,7 @@
+
 /**
  * Project: Environment-Agnostic IoT Monitoring Framework
- * Author: Korinne Margaret V. Sasil
+ * Author: Korinne Margaret V. Sasil, Mikhail Alexi D. Hatulan
  * Institute: University of San Carlos, Talamban Campus
  */
 
@@ -38,6 +39,7 @@
 #define DISCOVERY_INTERVAL_MS       (10 * 1000) 
 #define MQTT_TOPIC                  "usc/thesis/tenant-123/N001/tlm"
 #define MQTT_CMD_TOPIC              "usc/thesis/tenant-123/N001/cmd"
+#define MQTT_ACK_TOPIC              "usc/thesis/tenant-123/N001/ack"
 
 static const char *TAG = "THESIS_NODE_N001";
 
@@ -107,6 +109,7 @@ esp_mqtt_client_handle_t mqtt_client = NULL;
 
 SemaphoreHandle_t i2c_mutex;
 SemaphoreHandle_t data_mutex;
+SemaphoreHandle_t task_tracking_mutex;
 
 bool port_active[4][4] = {
     {true, true, true, true},
@@ -131,7 +134,45 @@ typedef struct {
 
 NodeData global_node_data[4];
 
+// Track background auto-shutoff task handles per actuator port
+TaskHandle_t auto_shutoff_task_handles[NUM_ACTUATORS] = {NULL, NULL, NULL, NULL, NULL, NULL};
+
 static esp_err_t i2c_master_init(void);
+
+// ==========================================
+// ENHANCED TWO-STEP ACKNOWLEDGEMENT LOGIC
+// ==========================================
+static void send_command_ack(const char *cid, const char *status, const char *details) {
+    if (!is_mqtt_connected || mqtt_client == NULL) {
+        return;
+    }
+
+    cJSON *ack_root = cJSON_CreateObject();
+    if (ack_root == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for ACK JSON structure.");
+        return;
+    }
+
+    // Standardized global metadata block matching system architecture
+    cJSON_AddStringToObject(ack_root, "t", "ack");
+    cJSON_AddNumberToObject(ack_root, "v", 1);
+    cJSON_AddStringToObject(ack_root, "tid", "tenant-123");
+    cJSON_AddStringToObject(ack_root, "nid", "N001");
+    
+    // Command validation context
+    cJSON_AddStringToObject(ack_root, "cid", cid ? cid : "unknown");
+    cJSON_AddStringToObject(ack_root, "status", status);
+    cJSON_AddStringToObject(ack_root, "details", details ? details : "");
+    cJSON_AddNumberToObject(ack_root, "ts", (double)time(NULL));
+
+    char *payload = cJSON_PrintUnformatted(ack_root);
+    if (payload != NULL) {
+        esp_mqtt_client_publish(mqtt_client, MQTT_ACK_TOPIC, payload, 0, 1, 0);
+        ESP_LOGI(TAG, "Command ACK published -> Status: %s | ID: %s", status, cid ? cid : "unknown");
+        free(payload);
+    }
+    cJSON_Delete(ack_root);
+}
 
 // ==========================================
 // BIT-BANG I2C BUS RECOVERY ROUTINE
@@ -229,23 +270,33 @@ static void init_actuators(void) {
 typedef struct {
     int target_idx;
     int duration_ms;
+    char cid[64];
 } auto_shutoff_args_t;
 
 void auto_shutoff_task(void *pvParameter) {
     auto_shutoff_args_t *args = (auto_shutoff_args_t *)pvParameter;
     
-    // Hold execution for the specified duration window
+    // Hold execution context safely during the dynamic delay window
     vTaskDelay(pdMS_TO_TICKS(args->duration_ms));
     
     int mapped_gpio = actuator_gpios[args->target_idx];
     ledc_channel_t mapped_chan = actuator_channels[args->target_idx];
     
-    // Return hardware to 0V failsafe state
+    // Force target physical terminal to ground state
     ledc_stop(ACTUATOR_LEDC_MODE, mapped_chan, 0);
     gpio_set_level(mapped_gpio, 0);
     
     ESP_LOGW(TAG, ">>> Auto-shutoff triggered for OUT%d after %d ms <<<", args->target_idx + 1, args->duration_ms);
     
+    // Issue the second-step deferred execution completion response
+    send_command_ack(args->cid, "completed", "Auto-shutoff execution window expired safely");
+
+    // Clean tracking structures thread-safely before self-deletion
+    if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
+        auto_shutoff_task_handles[args->target_idx] = NULL;
+        xSemaphoreGive(task_tracking_mutex);
+    }
+
     free(args);
     vTaskDelete(NULL);
 }
@@ -303,6 +354,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             
             cJSON *root = cJSON_Parse(json_string);
             if (root) {
+                cJSON *cid_item = cJSON_GetObjectItem(root, "cid");
+                const char *cid_str = (cid_item && cJSON_IsString(cid_item)) ? cid_item->valuestring : "unknown";
+
                 cJSON *act_item = cJSON_GetObjectItem(root, "action");
                 if (act_item && cJSON_IsString(act_item)) {
                     const char *action = act_item->valuestring;
@@ -312,8 +366,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         int target_bus = (bus_id_item && cJSON_IsNumber(bus_id_item)) ? bus_id_item->valueint : 0;
                         
                         ESP_LOGI(TAG, "Schema payload validated for Bus %d. Executing recovery routine...", target_bus);
+                        send_command_ack(cid_str, "started", "Beginning I2C recovery cycle");
                         recover_i2c_bus();
                         xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+                        send_command_ack(cid_str, "completed", "I2C bus recovery complete");
                     } 
                     
                     else if (strcmp(action, "actuate") == 0) {
@@ -330,11 +386,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             if (target_idx >= 0 && target_idx < NUM_ACTUATORS) { 
                                 int mapped_gpio = actuator_gpios[target_idx];
                                 ledc_channel_t mapped_chan = actuator_channels[target_idx];
+                                bool actuator_active_state = false;
 
                                 if (strcmp(mode_str, "bin") == 0) {
                                     cJSON *state_item = cJSON_GetObjectItem(root, "state");
                                     if (state_item && cJSON_IsNumber(state_item)) {
                                         int state_val = state_item->valueint;
+                                        actuator_active_state = (state_val > 0);
                                         
                                         ledc_stop(ACTUATOR_LEDC_MODE, mapped_chan, state_val);
                                         gpio_set_level(mapped_gpio, state_val);
@@ -346,6 +404,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                     cJSON *duty_item = cJSON_GetObjectItem(root, "duty");
                                     if (duty_item && cJSON_IsNumber(duty_item)) {
                                         int duty_val = duty_item->valueint;
+                                        actuator_active_state = (duty_val > 0);
                                         
                                         ledc_set_duty(ACTUATOR_LEDC_MODE, mapped_chan, duty_val);
                                         ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
@@ -354,17 +413,49 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                     }
                                 }
                                 
-                                // Spin up background shut-off timer if requested
-                                if (duration_ms > 0) {
-                                    auto_shutoff_args_t *args = malloc(sizeof(auto_shutoff_args_t));
-                                    args->target_idx = target_idx;
-                                    args->duration_ms = duration_ms;
-                                    xTaskCreate(auto_shutoff_task, "auto_shutoff", 2048, (void *)args, 5, NULL);
+                                // Dynamic Override & Safe Task Cancellation Logic
+                                if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
+                                    if (auto_shutoff_task_handles[target_idx] != NULL) {
+                                        vTaskDelete(auto_shutoff_task_handles[target_idx]);
+                                        auto_shutoff_task_handles[target_idx] = NULL;
+                                        ESP_LOGW(TAG, "Safely terminated legacy timed worker task on OUT%d to protect override context.", target_idx + 1);
+                                    }
+                                    xSemaphoreGive(task_tracking_mutex);
+                                }
+
+                                // State Routing Framework
+                                if (actuator_active_state) {
+                                    if (duration_ms > 0) {
+                                        // Case A: Driven ON using a dynamic auto-shutoff execution window
+                                        send_command_ack(cid_str, "started", "Actuator driven high, auto-shutoff armed");
+                                        
+                                        auto_shutoff_args_t *args = malloc(sizeof(auto_shutoff_args_t));
+                                        if (args != NULL) {
+                                            args->target_idx = target_idx;
+                                            args->duration_ms = duration_ms;
+                                            strncpy(args->cid, cid_str, sizeof(args->cid) - 1);
+                                            args->cid[sizeof(args->cid) - 1] = '\0';
+                                            
+                                            if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
+                                                xTaskCreate(auto_shutoff_task, "auto_shutoff", 2048, (void *)args, 5, &auto_shutoff_task_handles[target_idx]);
+                                                xSemaphoreGive(task_tracking_mutex);
+                                            }
+                                        }
+                                    } else {
+                                        // Case B: Driven ON indefinitely (supports infinite duration sequence changes)
+                                        send_command_ack(cid_str, "started", "Actuator driven high indefinitely");
+                                    }
+                                } else {
+                                    // Case C: Explicitly driven LOW (Turned OFF)
+                                    send_command_ack(cid_str, "stopped", "Actuator set to default idle state");
                                 }
                                 
                             } else {
                                 ESP_LOGW(TAG, "Actuation rejected. Port '%d' out of bounds.", target_idx + 1);
+                                send_command_ack(cid_str, "failed", "Port limit out of bounds");
                             }
+                        } else {
+                            send_command_ack(cid_str, "failed", "Missing dynamic execution parameters");
                         }
                     }
 
@@ -378,6 +469,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             
                             if (chip_idx >= 0 && chip_idx < 4 && ch_idx >= 0 && ch_idx < 4) {
                                 bool set_active = (strcmp(action, "sensor_port_up") == 0);
+                                send_command_ack(cid_str, "started", "Modifying software configuration states");
+                                
                                 if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
                                     port_active[chip_idx][ch_idx] = set_active;
                                     xSemaphoreGive(data_mutex);
@@ -385,6 +478,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                 ESP_LOGW(TAG, "Altered configuration: Chip Index [%d] Port [%d] -> %s", 
                                          chip_idx, ch_idx, set_active ? "ENABLED" : "DISABLED");
                                 xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+                                
+                                send_command_ack(cid_str, "completed", "Target port map dynamically adjusted");
+                            } else {
+                                send_command_ack(cid_str, "failed", "Chip or port argument range out of bounds");
                             }
                         }
                     }
@@ -760,6 +857,7 @@ void discovery_builder_task(void *pvParameter) {
 void app_main(void) {
     i2c_mutex = xSemaphoreCreateMutex();
     data_mutex = xSemaphoreCreateMutex();
+    task_tracking_mutex = xSemaphoreCreateMutex();
     s_hardware_event_group = xEventGroupCreate();
 
     init_actuators(); 
@@ -777,3 +875,5 @@ void app_main(void) {
 
     network_init();
 }
+
+
