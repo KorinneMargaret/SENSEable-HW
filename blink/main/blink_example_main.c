@@ -410,6 +410,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                         ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
                                         ESP_LOGI(TAG, "PWM: OUT%d (GPIO %d) -> Duty: %d/255 [Duration: %d ms]", 
                                                  target_idx + 1, mapped_gpio, duty_val, duration_ms);
+                                        ESP_LOGW(TAG, "CURRENT FREE RAM: %" PRIu32 " bytes", esp_get_free_heap_size());
                                     }
                                 }
                                 
