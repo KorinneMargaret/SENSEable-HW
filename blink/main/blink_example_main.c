@@ -1,4 +1,3 @@
-
 /**
  * Project: Environment-Agnostic IoT Monitoring Framework
  * Author: Korinne Margaret V. Sasil, Mikhail Alexi D. Hatulan
@@ -9,6 +8,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -32,7 +32,7 @@
 #define WIFI_SSID                   "Hello"
 #define WIFI_PASS                   "oof000fo"
 
-#define MQTT_BROKER_URI             "mqtts://10.136.54.162:8883"
+#define MQTT_BROKER_URI             "mqtts://10.46.57.162:8883"
 #define MQTT_USERNAME               "esp32_client"
 #define MQTT_PASSWORD               "pass1234"
 #define MQTT_DISCO_TOPIC            "usc/thesis/tenant-123/N001/disco" 
@@ -71,25 +71,27 @@ const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
 // 3. MOSQUITTO ROOT CA
 // ==========================================
 static const char *mosqmq_root_ca =
+
 "-----BEGIN CERTIFICATE-----\n"
-"MIIDETCCAfmgAwIBAgIUDf39/NPvfdRYZlvpVCoiLhRF9McwDQYJKoZIhvcNAQEL\n"
-"BQAwGDEWMBQGA1UEAwwNTXlMb2NhbFJvb3RDQTAeFw0yNjA3MTUwNTI1NDRaFw0z\n"
-"NjA3MTIwNTI1NDRaMBgxFjAUBgNVBAMMDU15TG9jYWxSb290Q0EwggEiMA0GCSqG\n"
-"SIb3DQEBAQUAA4IBDwAwggEKAoIBAQDsMINZ1TB557Tk44B1XLfncup0v93tm2vw\n"
-"UnCmTXtHytsKPRHjLfaGJ2ADJEoibERY9qNsnoECvIr9q8uPTYonrCv0lY3gVvBg\n"
-"LpMVLM5aIQqgfuhW5EK6iJ0KaXDxSUz+1zX4Djvqy8vs5rMsVZbSKvPoaXS5+20p\n"
-"Wwx4YYiz7fOBErFBWpmLZnGwGaxJzUGA27JADvGE/dGVhp2ptJ7a2kqqlIrc/5Xs\n"
-"TroGge7iv3dt8mEKHv2Zr0T8/aoFOYs8LYMiin8bdzU+f8o+cuHKUrCBR9yx3X0q\n"
-"68MBlPHKEkIO00rNif27+/Fgmwn1HXNZSpgTNcy/xzbP0saTyqhFAgMBAAGjUzBR\n"
-"MB0GA1UdDgQWBBQZd6noDe1fqe5ycvdVd3MZfgD3PjAfBgNVHSMEGDAWgBQZd6no\n"
-"De1fqe5ycvdVd3MZfgD3PjAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\n"
-"A4IBAQDOWakED1k49pyEHNehrzOAnycMKdtOFtOy30mFNFpWsFgGcyC1Bod4wuO8\n"
-"3V30NfOQbrL9t5punEz410dWaiQ6vIL5Fw3rWYDcEYpSNdjGxhECnGTIoh7peb55\n"
-"ShLQFx75IvgvezD3SK3YP2hM6DbvicCKMkk90a9FdIqCsSH4Pl+oKzHWu50P1gV4\n"
-"FCZ+3vDBHf9v/JqEy555zDRGNKql+ulbM40F2CkB8vljrI2cdUMTz/dsgqc8KIGy\n"
-"RyBJHcOHNj8iInQTtbgyEsJPkV4D3MA1u4Y238kGNrCj3O4i6ejzi5kQUunIvtX+\n"
-"PwjIMuh1hKDNc8Raxz+8S6S+iXw2\n"
+"MIIDETCCAfmgAwIBAgIUedK+sh58AoIa3Oke5KsF5lrFUkIwDQYJKoZIhvcNAQEL\n"
+"BQAwGDEWMBQGA1UEAwwNTXlMb2NhbFJvb3RDQTAeFw0yNjA4MTgwNzE1MzNaFw0z\n"
+"NjA4MTUwNzE1MzNaMBgxFjAUBgNVBAMMDU15TG9jYWxSb290Q0EwggEiMA0GCSqG\n"
+"SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCGw6vb2uBtEkKJzt0Ys7BMrY/nn5LRKVDO\n"
+"8tAmPvzaJFU8BwBhcLe0CL1hqvSfQLSLAWxZwKboYXTzXlR+voPVreJVhlnOYrJh\n"
+"LlDGpyq+WZZ20L8INlfHtKLBVnlB+u504/IO6wfhOs+pJThe5DDUc4xzy8P+BAE5\n"
+"xEWzbGdI9yqiZiolfOIeIEIGlHjBXLLc7oCjmqOKUsLV2KHYbZ7rGT5SvctDjm6R\n"
+"veI5JA+lGrSEoLVn8Ju2vglVC5h0sa6SBg6b5x2UvuuBlHmpWNVkLdR0JLYGkPUp\n"
+"9JzQNYQ+5ZM0SlFRGSPENQOTCXgrkQdW6K6GqTJKFjhhEi4icuAHAgMBAAGjUzBR\n"
+"MB0GA1UdDgQWBBSvPWk5tXG6rDzgRVlakaX3ufX4ljAfBgNVHSMEGDAWgBSvPWk5\n"
+"tXG6rDzgRVlakaX3ufX4ljAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\n"
+"A4IBAQB/uAE1KgRyRhGN+kMR4VSYbONA7u29HUsjBhbZQhhAhpFXWvEWiZlPEwPF\n"
+"KLdxJTK36FOMAsqUe4zmK/Zn2cJEKpC+zjdp05PhukUOZHyd5fl7b+A5Nh8FrdSN\n"
+"c5uoXr5kHlJww3BPuJCqOwoPvnMstrmaIdaTZ2wyq78asqjZOiWGvjKCPs/PgecE\n"
+"ABw+dfcUgaCw4RbFj4xTliG7hL21tNOCzjcarDTXTNvrNPVnsKZpBb4zXrY6zGVC\n"
+"HQPwEIdKhtTUzElW6KGWXjrF0pxFnydVN95wS9V7YwBhrUaeI3++ppSLHJDPRlaN\n"
+"r2tlSW4ji0nPCdhhrcEEKAQFn0MW\n"
 "-----END CERTIFICATE-----\n";
+
 
 // ==========================================
 // 4. HARDWARE CONSTANTS & GLOBAL STATE
@@ -134,8 +136,17 @@ typedef struct {
 
 NodeData global_node_data[4];
 
+typedef struct {
+    int target_idx;
+    int duration_ms;
+    char cid[64];
+} auto_shutoff_args_t;
+
 // Track background auto-shutoff task handles per actuator port
 TaskHandle_t auto_shutoff_task_handles[NUM_ACTUATORS] = {NULL, NULL, NULL, NULL, NULL, NULL};
+
+// STATIC ALLOCATION: Permanent memory block to prevent memory leaks during vTaskDelete
+auto_shutoff_args_t global_timer_args[NUM_ACTUATORS]; 
 
 static esp_err_t i2c_master_init(void);
 
@@ -148,18 +159,13 @@ static void send_command_ack(const char *cid, const char *status, const char *de
     }
 
     cJSON *ack_root = cJSON_CreateObject();
-    if (ack_root == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate memory for ACK JSON structure.");
-        return;
-    }
+    if (ack_root == NULL) return;
 
-    // Standardized global metadata block matching system architecture
     cJSON_AddStringToObject(ack_root, "t", "ack");
     cJSON_AddNumberToObject(ack_root, "v", 1);
     cJSON_AddStringToObject(ack_root, "tid", "tenant-123");
     cJSON_AddStringToObject(ack_root, "nid", "N001");
     
-    // Command validation context
     cJSON_AddStringToObject(ack_root, "cid", cid ? cid : "unknown");
     cJSON_AddStringToObject(ack_root, "status", status);
     cJSON_AddStringToObject(ack_root, "details", details ? details : "");
@@ -267,12 +273,6 @@ static void init_actuators(void) {
 // ==========================================
 // BACKGROUND AUTO-SHUTOFF TIMER
 // ==========================================
-typedef struct {
-    int target_idx;
-    int duration_ms;
-    char cid[64];
-} auto_shutoff_args_t;
-
 void auto_shutoff_task(void *pvParameter) {
     auto_shutoff_args_t *args = (auto_shutoff_args_t *)pvParameter;
     
@@ -297,7 +297,7 @@ void auto_shutoff_task(void *pvParameter) {
         xSemaphoreGive(task_tracking_mutex);
     }
 
-    free(args);
+    // No free() required. The args pointer resolves to the permanent global array.
     vTaskDelete(NULL);
 }
 
@@ -347,149 +347,156 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         is_mqtt_connected = false;
     } 
     else if (event_id == MQTT_EVENT_DATA) {
-        char *json_string = malloc(event->data_len + 1);
-        if (json_string) {
-            memcpy(json_string, event->data, event->data_len);
-            json_string[event->data_len] = '\0';
+        
+        // Prevent stack overflow by capping maximum payload size to 1024 bytes
+        if (event->data_len >= 1024) {
+            ESP_LOGE(TAG, "Payload exceeds stack buffer size. Dropping packet.");
+            return;
+        }
+
+        // STATIC STACK BUFFER ALLOCATION (No dynamic malloc needed here)
+        char json_string[1024];
+        memcpy(json_string, event->data, event->data_len);
+        json_string[event->data_len] = '\0';
             
-            cJSON *root = cJSON_Parse(json_string);
-            if (root) {
-                cJSON *cid_item = cJSON_GetObjectItem(root, "cid");
-                const char *cid_str = (cid_item && cJSON_IsString(cid_item)) ? cid_item->valuestring : "unknown";
+        cJSON *root = cJSON_Parse(json_string);
+        if (root) {
+            cJSON *cid_item = cJSON_GetObjectItem(root, "cid");
+            const char *cid_str = (cid_item && cJSON_IsString(cid_item)) ? cid_item->valuestring : "unknown";
 
-                cJSON *act_item = cJSON_GetObjectItem(root, "action");
-                if (act_item && cJSON_IsString(act_item)) {
-                    const char *action = act_item->valuestring;
+            cJSON *act_item = cJSON_GetObjectItem(root, "action");
+            if (act_item && cJSON_IsString(act_item)) {
+                const char *action = act_item->valuestring;
+                
+                if (strcmp(action, "bus_recovery") == 0) {
+                    cJSON *bus_id_item = cJSON_GetObjectItem(root, "bus_id");
+                    int target_bus = (bus_id_item && cJSON_IsNumber(bus_id_item)) ? bus_id_item->valueint : 0;
                     
-                    if (strcmp(action, "bus_recovery") == 0) {
-                        cJSON *bus_id_item = cJSON_GetObjectItem(root, "bus_id");
-                        int target_bus = (bus_id_item && cJSON_IsNumber(bus_id_item)) ? bus_id_item->valueint : 0;
-                        
-                        ESP_LOGI(TAG, "Schema payload validated for Bus %d. Executing recovery routine...", target_bus);
-                        send_command_ack(cid_str, "started", "Beginning I2C recovery cycle");
-                        recover_i2c_bus();
-                        xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
-                        send_command_ack(cid_str, "completed", "I2C bus recovery complete");
-                    } 
+                    ESP_LOGI(TAG, "Schema payload validated for Bus %d. Executing recovery routine...", target_bus);
+                    send_command_ack(cid_str, "started", "Beginning I2C recovery cycle");
+                    recover_i2c_bus();
+                    xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+                    send_command_ack(cid_str, "completed", "I2C bus recovery complete");
+                } 
+                
+                else if (strcmp(action, "actuate") == 0) {
+                    cJSON *port_item = cJSON_GetObjectItem(root, "port");
+                    cJSON *mode_item = cJSON_GetObjectItem(root, "mode");
+                    cJSON *dur_item = cJSON_GetObjectItem(root, "dur"); 
                     
-                    else if (strcmp(action, "actuate") == 0) {
-                        cJSON *port_item = cJSON_GetObjectItem(root, "port");
-                        cJSON *mode_item = cJSON_GetObjectItem(root, "mode");
-                        cJSON *dur_item = cJSON_GetObjectItem(root, "dur"); 
+                    if (port_item && mode_item && dur_item && cJSON_IsNumber(port_item) && cJSON_IsString(mode_item)) {
                         
-                        if (port_item && mode_item && dur_item && cJSON_IsNumber(port_item) && cJSON_IsString(mode_item)) {
+                        int target_idx = port_item->valueint - 1; 
+                        const char *mode_str = mode_item->valuestring;
+                        int duration_ms = cJSON_IsNumber(dur_item) ? dur_item->valueint : 0;
+
+                        if (target_idx >= 0 && target_idx < NUM_ACTUATORS) { 
+                            int mapped_gpio = actuator_gpios[target_idx];
+                            ledc_channel_t mapped_chan = actuator_channels[target_idx];
+                            bool actuator_active_state = false;
+
+                            if (strcmp(mode_str, "bin") == 0) {
+                                cJSON *state_item = cJSON_GetObjectItem(root, "state");
+                                if (state_item && cJSON_IsNumber(state_item)) {
+                                    int state_val = state_item->valueint;
+                                    actuator_active_state = (state_val > 0);
+                                    
+                                    ledc_stop(ACTUATOR_LEDC_MODE, mapped_chan, state_val);
+                                    gpio_set_level(mapped_gpio, state_val);
+                                    ESP_LOGI(TAG, "Binary: OUT%d (GPIO %d) -> %d [Duration: %d ms]", 
+                                             target_idx + 1, mapped_gpio, state_val, duration_ms);
+                                }
+                            } 
+                            else if (strcmp(mode_str, "pwm") == 0) {
+                                cJSON *duty_item = cJSON_GetObjectItem(root, "duty");
+                                if (duty_item && cJSON_IsNumber(duty_item)) {
+                                    int duty_val = duty_item->valueint;
+                                    actuator_active_state = (duty_val > 0);
+                                    
+                                    ledc_set_duty(ACTUATOR_LEDC_MODE, mapped_chan, duty_val);
+                                    ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
+                                    ESP_LOGI(TAG, "PWM: OUT%d (GPIO %d) -> Duty: %d/255 [Duration: %d ms]", 
+                                             target_idx + 1, mapped_gpio, duty_val, duration_ms);
+                                }
+                            }
                             
-                            int target_idx = port_item->valueint - 1; 
-                            const char *mode_str = mode_item->valuestring;
-                            int duration_ms = cJSON_IsNumber(dur_item) ? dur_item->valueint : 0;
-
-                            if (target_idx >= 0 && target_idx < NUM_ACTUATORS) { 
-                                int mapped_gpio = actuator_gpios[target_idx];
-                                ledc_channel_t mapped_chan = actuator_channels[target_idx];
-                                bool actuator_active_state = false;
-
-                                if (strcmp(mode_str, "bin") == 0) {
-                                    cJSON *state_item = cJSON_GetObjectItem(root, "state");
-                                    if (state_item && cJSON_IsNumber(state_item)) {
-                                        int state_val = state_item->valueint;
-                                        actuator_active_state = (state_val > 0);
-                                        
-                                        ledc_stop(ACTUATOR_LEDC_MODE, mapped_chan, state_val);
-                                        gpio_set_level(mapped_gpio, state_val);
-                                        ESP_LOGI(TAG, "Binary: OUT%d (GPIO %d) -> %d [Duration: %d ms]", 
-                                                 target_idx + 1, mapped_gpio, state_val, duration_ms);
-                                    }
-                                } 
-                                else if (strcmp(mode_str, "pwm") == 0) {
-                                    cJSON *duty_item = cJSON_GetObjectItem(root, "duty");
-                                    if (duty_item && cJSON_IsNumber(duty_item)) {
-                                        int duty_val = duty_item->valueint;
-                                        actuator_active_state = (duty_val > 0);
-                                        
-                                        ledc_set_duty(ACTUATOR_LEDC_MODE, mapped_chan, duty_val);
-                                        ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
-                                        ESP_LOGI(TAG, "PWM: OUT%d (GPIO %d) -> Duty: %d/255 [Duration: %d ms]", 
-                                                 target_idx + 1, mapped_gpio, duty_val, duration_ms);
-                                        ESP_LOGW(TAG, "CURRENT FREE RAM: %" PRIu32 " bytes", esp_get_free_heap_size());
-                                    }
+                            // Dynamic Override & Safe Task Cancellation Logic
+                            if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
+                                if (auto_shutoff_task_handles[target_idx] != NULL) {
+                                    vTaskDelete(auto_shutoff_task_handles[target_idx]);
+                                    auto_shutoff_task_handles[target_idx] = NULL;
+                                    ESP_LOGW(TAG, "Safely terminated legacy timed worker task on OUT%d to protect override context.", target_idx + 1);
                                 }
-                                
-                                // Dynamic Override & Safe Task Cancellation Logic
-                                if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
-                                    if (auto_shutoff_task_handles[target_idx] != NULL) {
-                                        vTaskDelete(auto_shutoff_task_handles[target_idx]);
-                                        auto_shutoff_task_handles[target_idx] = NULL;
-                                        ESP_LOGW(TAG, "Safely terminated legacy timed worker task on OUT%d to protect override context.", target_idx + 1);
-                                    }
-                                    xSemaphoreGive(task_tracking_mutex);
-                                }
+                                xSemaphoreGive(task_tracking_mutex);
+                            }
 
-                                // State Routing Framework
-                                if (actuator_active_state) {
-                                    if (duration_ms > 0) {
-                                        // Case A: Driven ON using a dynamic auto-shutoff execution window
-                                        send_command_ack(cid_str, "started", "Actuator driven high, auto-shutoff armed");
-                                        
-                                        auto_shutoff_args_t *args = malloc(sizeof(auto_shutoff_args_t));
-                                        if (args != NULL) {
-                                            args->target_idx = target_idx;
-                                            args->duration_ms = duration_ms;
-                                            strncpy(args->cid, cid_str, sizeof(args->cid) - 1);
-                                            args->cid[sizeof(args->cid) - 1] = '\0';
-                                            
-                                            if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
-                                                xTaskCreate(auto_shutoff_task, "auto_shutoff", 2048, (void *)args, 5, &auto_shutoff_task_handles[target_idx]);
-                                                xSemaphoreGive(task_tracking_mutex);
-                                            }
-                                        }
-                                    } else {
-                                        // Case B: Driven ON indefinitely (supports infinite duration sequence changes)
-                                        send_command_ack(cid_str, "started", "Actuator driven high indefinitely");
+                            // State Routing Framework
+                            if (actuator_active_state) {
+                                if (duration_ms > 0) {
+                                    // Case A: Driven ON using a dynamic auto-shutoff execution window
+                                    send_command_ack(cid_str, "started", "Actuator driven high, auto-shutoff armed");
+                                    
+                                    // STATIC ALLOCATION: Safely overwriting permanent global memory
+                                    global_timer_args[target_idx].target_idx = target_idx;
+                                    global_timer_args[target_idx].duration_ms = duration_ms;
+                                    strncpy(global_timer_args[target_idx].cid, cid_str, sizeof(global_timer_args[target_idx].cid) - 1);
+                                    global_timer_args[target_idx].cid[sizeof(global_timer_args[target_idx].cid) - 1] = '\0';
+                                    
+                                    if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
+                                        xTaskCreate(auto_shutoff_task, "auto_shutoff", 2048, (void *)&global_timer_args[target_idx], 5, &auto_shutoff_task_handles[target_idx]);
+                                        xSemaphoreGive(task_tracking_mutex);
                                     }
                                 } else {
-                                    // Case C: Explicitly driven LOW (Turned OFF)
-                                    send_command_ack(cid_str, "stopped", "Actuator set to default idle state");
+                                    // Case B: Driven ON indefinitely 
+                                    send_command_ack(cid_str, "started", "Actuator driven high indefinitely");
                                 }
-                                
                             } else {
-                                ESP_LOGW(TAG, "Actuation rejected. Port '%d' out of bounds.", target_idx + 1);
-                                send_command_ack(cid_str, "failed", "Port limit out of bounds");
+                                // Case C: Explicitly driven LOW (Turned OFF)
+                                send_command_ack(cid_str, "stopped", "Actuator set to default idle state");
                             }
-                        } else {
-                            send_command_ack(cid_str, "failed", "Missing dynamic execution parameters");
-                        }
-                    }
-
-                    else if (strcmp(action, "sensor_port_up") == 0 || strcmp(action, "sensor_port_down") == 0) {
-                        cJSON *chip_item = cJSON_GetObjectItem(root, "chip");
-                        cJSON *ch_item = cJSON_GetObjectItem(root, "ch");
-                        
-                        if (chip_item && ch_item && cJSON_IsNumber(chip_item) && cJSON_IsNumber(ch_item)) {
-                            int chip_idx = chip_item->valueint;
-                            int ch_idx = ch_item->valueint;
                             
-                            if (chip_idx >= 0 && chip_idx < 4 && ch_idx >= 0 && ch_idx < 4) {
-                                bool set_active = (strcmp(action, "sensor_port_up") == 0);
-                                send_command_ack(cid_str, "started", "Modifying software configuration states");
-                                
-                                if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
-                                    port_active[chip_idx][ch_idx] = set_active;
-                                    xSemaphoreGive(data_mutex);
-                                }
-                                ESP_LOGW(TAG, "Altered configuration: Chip Index [%d] Port [%d] -> %s", 
-                                         chip_idx, ch_idx, set_active ? "ENABLED" : "DISABLED");
-                                xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
-                                
-                                send_command_ack(cid_str, "completed", "Target port map dynamically adjusted");
-                            } else {
-                                send_command_ack(cid_str, "failed", "Chip or port argument range out of bounds");
+                            // ==========================================
+                            // MEMORY TRACKER - Validating execution safety
+                            // ==========================================
+                            ESP_LOGW(TAG, "CURRENT FREE RAM: %" PRIu32 " bytes", esp_get_free_heap_size());
+                            
+                        } else {
+                            ESP_LOGW(TAG, "Actuation rejected. Port '%d' out of bounds.", target_idx + 1);
+                            send_command_ack(cid_str, "failed", "Port limit out of bounds");
+                        }
+                    } else {
+                        send_command_ack(cid_str, "failed", "Missing dynamic execution parameters");
+                    }
+                }
+
+                else if (strcmp(action, "sensor_port_up") == 0 || strcmp(action, "sensor_port_down") == 0) {
+                    cJSON *chip_item = cJSON_GetObjectItem(root, "chip");
+                    cJSON *ch_item = cJSON_GetObjectItem(root, "ch");
+                    
+                    if (chip_item && ch_item && cJSON_IsNumber(chip_item) && cJSON_IsNumber(ch_item)) {
+                        int chip_idx = chip_item->valueint;
+                        int ch_idx = ch_item->valueint;
+                        
+                        if (chip_idx >= 0 && chip_idx < 4 && ch_idx >= 0 && ch_idx < 4) {
+                            bool set_active = (strcmp(action, "sensor_port_up") == 0);
+                            send_command_ack(cid_str, "started", "Modifying software configuration states");
+                            
+                            if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
+                                port_active[chip_idx][ch_idx] = set_active;
+                                xSemaphoreGive(data_mutex);
                             }
+                            ESP_LOGW(TAG, "Altered configuration: Chip Index [%d] Port [%d] -> %s", 
+                                     chip_idx, ch_idx, set_active ? "ENABLED" : "DISABLED");
+                            xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+                            
+                            send_command_ack(cid_str, "completed", "Target port map dynamically adjusted");
+                        } else {
+                            send_command_ack(cid_str, "failed", "Chip or port argument range out of bounds");
                         }
                     }
                 }
-                cJSON_Delete(root);
             }
-            free(json_string);
+            cJSON_Delete(root);
         }
     }
 }
@@ -641,7 +648,7 @@ void ads_reader_task(void *pvParameter) {
                 if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     esp_err_t tx_err = ESP_FAIL;
                     if (ads_handles[i] != NULL) {
-                        tx_err = i2c_master_transmit(ads_handles[i], config_data, sizeof(config_data), -1);
+                        tx_err = i2c_master_transmit(ads_handles[i], config_data, sizeof(config_data), 100);
                     }
                     xSemaphoreGive(i2c_mutex);
 
@@ -659,7 +666,7 @@ void ads_reader_task(void *pvParameter) {
                     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                         esp_err_t rx_err = ESP_FAIL;
                         if (ads_handles[i] != NULL) {
-                            rx_err = i2c_master_transmit_receive(ads_handles[i], &reg_pointer, 1, read_buf, sizeof(read_buf), -1);
+                            rx_err = i2c_master_transmit_receive(ads_handles[i], &reg_pointer, 1, read_buf, sizeof(read_buf), 100);
                         }
                         xSemaphoreGive(i2c_mutex);
 
@@ -876,5 +883,3 @@ void app_main(void) {
 
     network_init();
 }
-
-
