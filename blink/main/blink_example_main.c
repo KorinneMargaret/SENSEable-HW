@@ -26,20 +26,8 @@
 #include "esp_netif_sntp.h"
 #include "cJSON.h"
 
-// ==========================================
-// 1. CREDENTIALS & TOPICS
-// ==========================================
-#define WIFI_SSID                   "Hello"
-#define WIFI_PASS                   "oof000fo"
-
-#define MQTT_BROKER_URI             "mqtts://10.44.142.162:8883"
-#define MQTT_USERNAME               "esp32_client"
-#define MQTT_PASSWORD               "pass1234"
-#define MQTT_DISCO_TOPIC            "usc/thesis/tenant-123/N001/disco" 
-#define DISCOVERY_INTERVAL_MS       (10 * 1000) 
-#define MQTT_TOPIC                  "usc/thesis/tenant-123/N001/tlm"
-#define MQTT_CMD_TOPIC              "usc/thesis/tenant-123/N001/cmd"
-#define MQTT_ACK_TOPIC              "usc/thesis/tenant-123/N001/ack"
+// Include your newly created configuration file
+#include "credentials.h"
 
 static const char *TAG = "THESIS_NODE_N001";
 
@@ -67,31 +55,6 @@ const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
 #define ACTUATOR_LEDC_TIMER         LEDC_TIMER_0
 #define ACTUATOR_LEDC_RES           LEDC_TIMER_8_BIT   
 #define ACTUATOR_LEDC_FREQ          5000               
-
-// ==========================================
-// 3. MOSQUITTO ROOT CA
-// ==========================================
-static const char *mosqmq_root_ca =
-"-----BEGIN CERTIFICATE-----\n"
-"MIIDETCCAfmgAwIBAgIUOnprsIiY/l5I+jyAu2Fp0CoF3PEwDQYJKoZIhvcNAQEL\n"
-"BQAwGDEWMBQGA1UEAwwNTXlMb2NhbFJvb3RDQTAeFw0yNjA4MTkwNjUyMjFaFw0z\n"
-"NjA4MTYwNjUyMjFaMBgxFjAUBgNVBAMMDU15TG9jYWxSb290Q0EwggEiMA0GCSqG\n"
-"SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCOOpoDmB6J5aWw8YaR4cGdmwWmSkALgWGA\n"
-"ejguGyaQdbG0fYOhesYUmGFXLZm9bI3L2pE3DNX9Chl5+QjfjfxOQoH9RViUHmB4\n"
-"IXg/jVDDlULBWWKBFQVhvBxWnhaiPNahCUUMVAGseuW/mCrt3y4UnOzi5ejzzYAh\n"
-"9Bo3n9o2Q266uoGngSHbqD9bCA+IjrfBoqM0S8z6xizEWLsTAImz2icPfL5BLttE\n"
-"IrwCLomwPwginkmxjP7V3/94bJJCe8UifNcu7Z4U15H+O5CVuuDVthQ63NnSmxYx\n"
-"fJs42O+gNR4zkk7PDMIPl+pv6XLs1zuHsftK4u1RpWHiFYJj1aENAgMBAAGjUzBR\n"
-"MB0GA1UdDgQWBBRWe2jc7hmuTQn1cTgWxTPzlt9BMDAfBgNVHSMEGDAWgBRWe2jc\n"
-"7hmuTQn1cTgWxTPzlt9BMDAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\n"
-"A4IBAQAb7fsVCTSuQlCBtx09lZ7uUFSGl1svCExkN4fFTZ2GhPv4ffZb3VNO7lmE\n"
-"Ar6ssY8bxxFYjJK6AXJmyrcBHg3SsdRf3rpFtzrtZkAsbxPgxtGv5WbZHJH1A8jP\n"
-"7Bjh3kU8ObW8qdnTxFsUONByZL+KPo2gX5AwgUzpfceA5IYC0OJ9CwJfAiEGq17Z\n"
-"rA5aiclJaoBMoNuZ4i9xvPTAKvKArdr8vpfYXEVymCFnLwCFVP5XLyMaCINXzQ/v\n"
-"DqkUWnJOkrV0Cd+mNyvtkxxLDr7QuhITf9EVrqV5wwDWWp6hnlsgqvdYopF+spKr\n"
-"EkrIABE0Gwe52naKEnclLZp+8if3\n"
-"-----END CERTIFICATE-----\n";
-
 
 // ==========================================
 // 4. HARDWARE CONSTANTS & GLOBAL STATE
