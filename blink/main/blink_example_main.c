@@ -32,7 +32,7 @@
 #define WIFI_SSID                   "Hello"
 #define WIFI_PASS                   "oof000fo"
 
-#define MQTT_BROKER_URI             "mqtts://10.46.57.162:8883"
+#define MQTT_BROKER_URI             "mqtts://10.44.142.162:8883"
 #define MQTT_USERNAME               "esp32_client"
 #define MQTT_PASSWORD               "pass1234"
 #define MQTT_DISCO_TOPIC            "usc/thesis/tenant-123/N001/disco" 
@@ -51,7 +51,8 @@ static const char *TAG = "THESIS_NODE_N001";
 // ==========================================
 #define NUM_ACTUATORS       6  
 
-const int actuator_gpios[NUM_ACTUATORS] = {4, 5, 13, 14, 16, 17}; 
+// Replaced GPIO 5 with GPIO 25 to prevent boot-sequence strapping pin conflicts
+const int actuator_gpios[NUM_ACTUATORS] = {4, 25, 13, 14, 16, 17};
 
 const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
     LEDC_CHANNEL_0,
@@ -71,33 +72,32 @@ const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
 // 3. MOSQUITTO ROOT CA
 // ==========================================
 static const char *mosqmq_root_ca =
-
 "-----BEGIN CERTIFICATE-----\n"
-"MIIDETCCAfmgAwIBAgIUedK+sh58AoIa3Oke5KsF5lrFUkIwDQYJKoZIhvcNAQEL\n"
-"BQAwGDEWMBQGA1UEAwwNTXlMb2NhbFJvb3RDQTAeFw0yNjA4MTgwNzE1MzNaFw0z\n"
-"NjA4MTUwNzE1MzNaMBgxFjAUBgNVBAMMDU15TG9jYWxSb290Q0EwggEiMA0GCSqG\n"
-"SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCGw6vb2uBtEkKJzt0Ys7BMrY/nn5LRKVDO\n"
-"8tAmPvzaJFU8BwBhcLe0CL1hqvSfQLSLAWxZwKboYXTzXlR+voPVreJVhlnOYrJh\n"
-"LlDGpyq+WZZ20L8INlfHtKLBVnlB+u504/IO6wfhOs+pJThe5DDUc4xzy8P+BAE5\n"
-"xEWzbGdI9yqiZiolfOIeIEIGlHjBXLLc7oCjmqOKUsLV2KHYbZ7rGT5SvctDjm6R\n"
-"veI5JA+lGrSEoLVn8Ju2vglVC5h0sa6SBg6b5x2UvuuBlHmpWNVkLdR0JLYGkPUp\n"
-"9JzQNYQ+5ZM0SlFRGSPENQOTCXgrkQdW6K6GqTJKFjhhEi4icuAHAgMBAAGjUzBR\n"
-"MB0GA1UdDgQWBBSvPWk5tXG6rDzgRVlakaX3ufX4ljAfBgNVHSMEGDAWgBSvPWk5\n"
-"tXG6rDzgRVlakaX3ufX4ljAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\n"
-"A4IBAQB/uAE1KgRyRhGN+kMR4VSYbONA7u29HUsjBhbZQhhAhpFXWvEWiZlPEwPF\n"
-"KLdxJTK36FOMAsqUe4zmK/Zn2cJEKpC+zjdp05PhukUOZHyd5fl7b+A5Nh8FrdSN\n"
-"c5uoXr5kHlJww3BPuJCqOwoPvnMstrmaIdaTZ2wyq78asqjZOiWGvjKCPs/PgecE\n"
-"ABw+dfcUgaCw4RbFj4xTliG7hL21tNOCzjcarDTXTNvrNPVnsKZpBb4zXrY6zGVC\n"
-"HQPwEIdKhtTUzElW6KGWXjrF0pxFnydVN95wS9V7YwBhrUaeI3++ppSLHJDPRlaN\n"
-"r2tlSW4ji0nPCdhhrcEEKAQFn0MW\n"
+"MIIDETCCAfmgAwIBAgIUOnprsIiY/l5I+jyAu2Fp0CoF3PEwDQYJKoZIhvcNAQEL\n"
+"BQAwGDEWMBQGA1UEAwwNTXlMb2NhbFJvb3RDQTAeFw0yNjA4MTkwNjUyMjFaFw0z\n"
+"NjA4MTYwNjUyMjFaMBgxFjAUBgNVBAMMDU15TG9jYWxSb290Q0EwggEiMA0GCSqG\n"
+"SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCOOpoDmB6J5aWw8YaR4cGdmwWmSkALgWGA\n"
+"ejguGyaQdbG0fYOhesYUmGFXLZm9bI3L2pE3DNX9Chl5+QjfjfxOQoH9RViUHmB4\n"
+"IXg/jVDDlULBWWKBFQVhvBxWnhaiPNahCUUMVAGseuW/mCrt3y4UnOzi5ejzzYAh\n"
+"9Bo3n9o2Q266uoGngSHbqD9bCA+IjrfBoqM0S8z6xizEWLsTAImz2icPfL5BLttE\n"
+"IrwCLomwPwginkmxjP7V3/94bJJCe8UifNcu7Z4U15H+O5CVuuDVthQ63NnSmxYx\n"
+"fJs42O+gNR4zkk7PDMIPl+pv6XLs1zuHsftK4u1RpWHiFYJj1aENAgMBAAGjUzBR\n"
+"MB0GA1UdDgQWBBRWe2jc7hmuTQn1cTgWxTPzlt9BMDAfBgNVHSMEGDAWgBRWe2jc\n"
+"7hmuTQn1cTgWxTPzlt9BMDAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\n"
+"A4IBAQAb7fsVCTSuQlCBtx09lZ7uUFSGl1svCExkN4fFTZ2GhPv4ffZb3VNO7lmE\n"
+"Ar6ssY8bxxFYjJK6AXJmyrcBHg3SsdRf3rpFtzrtZkAsbxPgxtGv5WbZHJH1A8jP\n"
+"7Bjh3kU8ObW8qdnTxFsUONByZL+KPo2gX5AwgUzpfceA5IYC0OJ9CwJfAiEGq17Z\n"
+"rA5aiclJaoBMoNuZ4i9xvPTAKvKArdr8vpfYXEVymCFnLwCFVP5XLyMaCINXzQ/v\n"
+"DqkUWnJOkrV0Cd+mNyvtkxxLDr7QuhITf9EVrqV5wwDWWp6hnlsgqvdYopF+spKr\n"
+"EkrIABE0Gwe52naKEnclLZp+8if3\n"
 "-----END CERTIFICATE-----\n";
 
 
 // ==========================================
 // 4. HARDWARE CONSTANTS & GLOBAL STATE
 // ==========================================
-#define I2C_MASTER_SDA_IO           11
-#define I2C_MASTER_SCL_IO           12
+#define I2C_MASTER_SDA_IO           21
+#define I2C_MASTER_SCL_IO           22
 #define I2C_MASTER_FREQ_HZ          100000
 #define REG_POINTER_CONVERT         0x00
 #define REG_POINTER_CONFIG          0x01
