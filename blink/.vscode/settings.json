@@ -14,6 +14,6 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\Nelia\\Downloads\\thesis espressif\\git\\SENSEable-HW\\blink\\build"
   ],
-  "idf.portWin": "COM3",
+  "idf.portWin": "COM17",
   "idf.flashType": "UART"
 }

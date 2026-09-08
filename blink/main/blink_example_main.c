@@ -25,11 +25,21 @@
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
 #include "cJSON.h"
+#include "esp_mac.h" // Added for Hardware MAC reading
 
 // Include your newly created configuration file
 #include "credentials.h"
 
-static const char *TAG = "THESIS_NODE_N001";
+static const char *TAG = "THESIS_NODE";
+
+// ==========================================
+// DYNAMIC TOPIC & ID BUFFERS
+// ==========================================
+char node_id[32];
+char topic_tlm[128];
+char topic_cmd[128];
+char topic_ack[128];
+char topic_disco[128];
 
 #define FLOATING_LEAK_MIN   4500
 #define FLOATING_LEAK_MAX   5000
@@ -114,6 +124,28 @@ auto_shutoff_args_t global_timer_args[NUM_ACTUATORS];
 static esp_err_t i2c_master_init(void);
 
 // ==========================================
+// DYNAMIC NODE ID GENERATION
+// ==========================================
+static void init_dynamic_identity(void) {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    
+    // Create unique ID using the last 3 bytes of the hardware MAC address
+    sprintf(node_id, "NODE-%02X%02X%02X", mac[3], mac[4], mac[5]);
+    
+    // Stitch the base prefix from credentials.h with the unique ID
+    sprintf(topic_tlm, "%s/%s/tlm", MQTT_TOPIC_PREFIX, node_id);
+    sprintf(topic_cmd, "%s/%s/cmd", MQTT_TOPIC_PREFIX, node_id);
+    sprintf(topic_ack, "%s/%s/ack", MQTT_TOPIC_PREFIX, node_id);
+    sprintf(topic_disco, "%s/%s/disco", MQTT_TOPIC_PREFIX, node_id);
+    
+    ESP_LOGI(TAG, "====================================");
+    ESP_LOGI(TAG, "DEVICE PROVISIONED AS: %s", node_id);
+    ESP_LOGI(TAG, "Command Topic: %s", topic_cmd);
+    ESP_LOGI(TAG, "====================================");
+}
+
+// ==========================================
 // ENHANCED TWO-STEP ACKNOWLEDGEMENT LOGIC
 // ==========================================
 static void send_command_ack(const char *cid, const char *status, const char *details) {
@@ -127,7 +159,9 @@ static void send_command_ack(const char *cid, const char *status, const char *de
     cJSON_AddStringToObject(ack_root, "t", "ack");
     cJSON_AddNumberToObject(ack_root, "v", 1);
     cJSON_AddStringToObject(ack_root, "tid", "tenant-123");
-    cJSON_AddStringToObject(ack_root, "nid", "N001");
+    
+    // Updated to use dynamic node_id
+    cJSON_AddStringToObject(ack_root, "nid", node_id);
     
     cJSON_AddStringToObject(ack_root, "cid", cid ? cid : "unknown");
     cJSON_AddStringToObject(ack_root, "status", status);
@@ -136,7 +170,8 @@ static void send_command_ack(const char *cid, const char *status, const char *de
 
     char *payload = cJSON_PrintUnformatted(ack_root);
     if (payload != NULL) {
-        esp_mqtt_client_publish(mqtt_client, MQTT_ACK_TOPIC, payload, 0, 1, 0);
+        // Updated to use dynamic topic_ack
+        esp_mqtt_client_publish(mqtt_client, topic_ack, payload, 0, 1, 0);
         ESP_LOGI(TAG, "Command ACK published -> Status: %s | ID: %s", status, cid ? cid : "unknown");
         free(payload);
     }
@@ -303,7 +338,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "SUCCESS! Secure TLS Connection to Mosquitto Established!");
         is_mqtt_connected = true;
         xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
-        esp_mqtt_client_subscribe(client, MQTT_CMD_TOPIC, 1);
+        
+        // Updated to subscribe to dynamic topic_cmd
+        esp_mqtt_client_subscribe(client, topic_cmd, 1);
     } 
     else if (event_id == MQTT_EVENT_DISCONNECTED) {
         ESP_LOGW(TAG, "MQTT Broker Disconnected.");
@@ -670,7 +707,10 @@ void telemetry_builder_task(void *pvParameter) {
         cJSON_AddStringToObject(root, "t", "tlm");
         cJSON_AddNumberToObject(root, "v", 1);
         cJSON_AddStringToObject(root, "tid", "tenant-123");
-        cJSON_AddStringToObject(root, "nid", "N001");
+        
+        // Updated to use dynamic node_id
+        cJSON_AddStringToObject(root, "nid", node_id);
+        
         cJSON_AddNumberToObject(root, "ts", (double)time(NULL));
 
         cJSON *adc_array = cJSON_AddArrayToObject(root, "adc");
@@ -701,7 +741,8 @@ void telemetry_builder_task(void *pvParameter) {
 
         char *payload_string = cJSON_PrintUnformatted(root);
         if (mqtt_client != NULL && payload_string != NULL) {
-            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload_string, 0, 1, 0);
+            // Updated to use dynamic topic_tlm
+            esp_mqtt_client_publish(mqtt_client, topic_tlm, payload_string, 0, 1, 0);
             ESP_LOGI(TAG, "Telemetry Payload Dispatched: %s", payload_string);
         }
         free(payload_string);
@@ -779,7 +820,10 @@ void discovery_builder_task(void *pvParameter) {
         cJSON_AddStringToObject(root, "t", "disco");
         cJSON_AddNumberToObject(root, "v", 1);
         cJSON_AddStringToObject(root, "tid", "tenant-123");
-        cJSON_AddStringToObject(root, "nid", "N001");
+        
+        // Updated to use dynamic node_id
+        cJSON_AddStringToObject(root, "nid", node_id);
+        
         cJSON_AddNumberToObject(root, "ts", (double)time(NULL));
 
         cJSON *bus_array = cJSON_AddArrayToObject(root, "buses");
@@ -814,7 +858,8 @@ void discovery_builder_task(void *pvParameter) {
 
         char *payload_string = cJSON_PrintUnformatted(root);
         if (mqtt_client != NULL && payload_string != NULL) {
-            esp_mqtt_client_publish(mqtt_client, MQTT_DISCO_TOPIC, payload_string, 0, 1, 1);
+            // Updated to use dynamic topic_disco
+            esp_mqtt_client_publish(mqtt_client, topic_disco, payload_string, 0, 1, 1);
             ESP_LOGW(TAG, "Topology Change Caught! New Discovery Packet Dispatched: %s", payload_string);
         }
         free(payload_string);
@@ -826,6 +871,9 @@ void discovery_builder_task(void *pvParameter) {
 // 6. APP MAIN ENTRY
 // ==========================================
 void app_main(void) {
+    // Generate identity immediately on boot
+    init_dynamic_identity();
+
     i2c_mutex = xSemaphoreCreateMutex();
     data_mutex = xSemaphoreCreateMutex();
     task_tracking_mutex = xSemaphoreCreateMutex();
