@@ -44,6 +44,7 @@ char topic_tlm[128];
 char topic_cmd[128];
 char topic_ack[128];
 char topic_disco[128];
+char topic_status[128]; // Buffer added for LWT status
 
 #define FLOATING_LEAK_MIN   4500
 #define FLOATING_LEAK_MAX   5000
@@ -144,6 +145,7 @@ static void init_dynamic_identity(void) {
     sprintf(topic_cmd,   "%s/%s/%s/cmd",   MQTT_TOPIC_ROOT, tenant_id, node_id);
     sprintf(topic_ack,   "%s/%s/%s/ack",   MQTT_TOPIC_ROOT, tenant_id, node_id);
     sprintf(topic_disco, "%s/%s/%s/disco", MQTT_TOPIC_ROOT, tenant_id, node_id);
+    sprintf(topic_status, "%s/%s/%s/status", MQTT_TOPIC_ROOT, tenant_id, node_id); // Initialize LWT Topic
     
     ESP_LOGI(TAG, "====================================");
     ESP_LOGI(TAG, "PROVISIONED AS: %s / %s", tenant_id, node_id);
@@ -337,6 +339,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
         
         esp_mqtt_client_subscribe(client, topic_cmd, 1);
+        
+        // Publish online status to overwrite any retained offline messages
+        esp_mqtt_client_publish(client, topic_status, "{\"t\":\"lwt\",\"status\":\"online\"}", 0, 1, 1);
     } 
     else if (event_id == MQTT_EVENT_DISCONNECTED) {
         ESP_LOGW(TAG, "MQTT Broker Disconnected.");
@@ -545,6 +550,15 @@ static void network_init(void) {
         .credentials.username = MQTT_USERNAME,
         .credentials.authentication.password = MQTT_PASSWORD,
         .broker.verification.certificate = mosqmq_root_ca,
+        
+        // Last Will and Testament Configuration
+        .session.last_will.topic  = topic_status,
+        .session.last_will.msg    = "{\"t\":\"lwt\",\"status\":\"offline\"}",
+        .session.last_will.qos    = 1,
+        .session.last_will.retain = 1,
+        
+        // Lower keepalive for rapid offline detection
+        .session.keepalive = 15,
     };
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
