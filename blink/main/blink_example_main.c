@@ -18,6 +18,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
+#include "nvs.h" 
 #include "mqtt_client.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
@@ -25,17 +26,20 @@
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
 #include "cJSON.h"
-#include "esp_mac.h" // Added for Hardware MAC reading
+#include "esp_mac.h" 
 
-// Include your newly created configuration file
 #include "credentials.h"
 
 static const char *TAG = "THESIS_NODE";
+
+#define TELEMETRY_INTERVAL_MS   10000
+#define DISCOVERY_HEARTBEAT_MS  60000
 
 // ==========================================
 // DYNAMIC TOPIC & ID BUFFERS
 // ==========================================
 char node_id[32];
+char tenant_id[32];
 char topic_tlm[128];
 char topic_cmd[128];
 char topic_ack[128];
@@ -49,7 +53,6 @@ char topic_disco[128];
 // ==========================================
 #define NUM_ACTUATORS       6  
 
-// Replaced GPIO 5 with GPIO 25 to prevent boot-sequence strapping pin conflicts
 const int actuator_gpios[NUM_ACTUATORS] = {4, 25, 13, 14, 16, 17};
 
 const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
@@ -115,10 +118,7 @@ typedef struct {
     char cid[64];
 } auto_shutoff_args_t;
 
-// Track background auto-shutoff task handles per actuator port
 TaskHandle_t auto_shutoff_task_handles[NUM_ACTUATORS] = {NULL, NULL, NULL, NULL, NULL, NULL};
-
-// STATIC ALLOCATION: Permanent memory block to prevent memory leaks during vTaskDelete
 auto_shutoff_args_t global_timer_args[NUM_ACTUATORS]; 
 
 static esp_err_t i2c_master_init(void);
@@ -130,17 +130,23 @@ static void init_dynamic_identity(void) {
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     
-    // Create unique ID using the last 3 bytes of the hardware MAC address
     sprintf(node_id, "NODE-%02X%02X%02X", mac[3], mac[4], mac[5]);
     
-    // Stitch the base prefix from credentials.h with the unique ID
-    sprintf(topic_tlm, "%s/%s/tlm", MQTT_TOPIC_PREFIX, node_id);
-    sprintf(topic_cmd, "%s/%s/cmd", MQTT_TOPIC_PREFIX, node_id);
-    sprintf(topic_ack, "%s/%s/ack", MQTT_TOPIC_PREFIX, node_id);
-    sprintf(topic_disco, "%s/%s/disco", MQTT_TOPIC_PREFIX, node_id);
+    strcpy(tenant_id, DEFAULT_TENANT_ID);
+    nvs_handle_t h;
+    if (nvs_open("senseable", NVS_READONLY, &h) == ESP_OK) {
+        size_t len = sizeof(tenant_id);
+        nvs_get_str(h, "tenant_id", tenant_id, &len);
+        nvs_close(h);
+    }
+    
+    sprintf(topic_tlm,   "%s/%s/%s/tlm",   MQTT_TOPIC_ROOT, tenant_id, node_id);
+    sprintf(topic_cmd,   "%s/%s/%s/cmd",   MQTT_TOPIC_ROOT, tenant_id, node_id);
+    sprintf(topic_ack,   "%s/%s/%s/ack",   MQTT_TOPIC_ROOT, tenant_id, node_id);
+    sprintf(topic_disco, "%s/%s/%s/disco", MQTT_TOPIC_ROOT, tenant_id, node_id);
     
     ESP_LOGI(TAG, "====================================");
-    ESP_LOGI(TAG, "DEVICE PROVISIONED AS: %s", node_id);
+    ESP_LOGI(TAG, "PROVISIONED AS: %s / %s", tenant_id, node_id);
     ESP_LOGI(TAG, "Command Topic: %s", topic_cmd);
     ESP_LOGI(TAG, "====================================");
 }
@@ -158,11 +164,8 @@ static void send_command_ack(const char *cid, const char *status, const char *de
 
     cJSON_AddStringToObject(ack_root, "t", "ack");
     cJSON_AddNumberToObject(ack_root, "v", 1);
-    cJSON_AddStringToObject(ack_root, "tid", "tenant-123");
-    
-    // Updated to use dynamic node_id
+    cJSON_AddStringToObject(ack_root, "tid", tenant_id);
     cJSON_AddStringToObject(ack_root, "nid", node_id);
-    
     cJSON_AddStringToObject(ack_root, "cid", cid ? cid : "unknown");
     cJSON_AddStringToObject(ack_root, "status", status);
     cJSON_AddStringToObject(ack_root, "details", details ? details : "");
@@ -170,7 +173,6 @@ static void send_command_ack(const char *cid, const char *status, const char *de
 
     char *payload = cJSON_PrintUnformatted(ack_root);
     if (payload != NULL) {
-        // Updated to use dynamic topic_ack
         esp_mqtt_client_publish(mqtt_client, topic_ack, payload, 0, 1, 0);
         ESP_LOGI(TAG, "Command ACK published -> Status: %s | ID: %s", status, cid ? cid : "unknown");
         free(payload);
@@ -274,28 +276,23 @@ static void init_actuators(void) {
 void auto_shutoff_task(void *pvParameter) {
     auto_shutoff_args_t *args = (auto_shutoff_args_t *)pvParameter;
     
-    // Hold execution context safely during the dynamic delay window
     vTaskDelay(pdMS_TO_TICKS(args->duration_ms));
     
     int mapped_gpio = actuator_gpios[args->target_idx];
     ledc_channel_t mapped_chan = actuator_channels[args->target_idx];
     
-    // Force target physical terminal to ground state
     ledc_stop(ACTUATOR_LEDC_MODE, mapped_chan, 0);
     gpio_set_level(mapped_gpio, 0);
     
     ESP_LOGW(TAG, ">>> Auto-shutoff triggered for OUT%d after %d ms <<<", args->target_idx + 1, args->duration_ms);
     
-    // Issue the second-step deferred execution completion response
     send_command_ack(args->cid, "completed", "Auto-shutoff execution window expired safely");
 
-    // Clean tracking structures thread-safely before self-deletion
     if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
         auto_shutoff_task_handles[args->target_idx] = NULL;
         xSemaphoreGive(task_tracking_mutex);
     }
 
-    // No free() required. The args pointer resolves to the permanent global array.
     vTaskDelete(NULL);
 }
 
@@ -339,7 +336,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         is_mqtt_connected = true;
         xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
         
-        // Updated to subscribe to dynamic topic_cmd
         esp_mqtt_client_subscribe(client, topic_cmd, 1);
     } 
     else if (event_id == MQTT_EVENT_DISCONNECTED) {
@@ -348,13 +344,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     } 
     else if (event_id == MQTT_EVENT_DATA) {
         
-        // Prevent stack overflow by capping maximum payload size to 1024 bytes
         if (event->data_len >= 1024) {
             ESP_LOGE(TAG, "Payload exceeds stack buffer size. Dropping packet.");
             return;
         }
 
-        // STATIC STACK BUFFER ALLOCATION (No dynamic malloc needed here)
         char json_string[1024];
         memcpy(json_string, event->data, event->data_len);
         json_string[event->data_len] = '\0';
@@ -362,7 +356,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         cJSON *root = cJSON_Parse(json_string);
         if (root) {
             cJSON *cid_item = cJSON_GetObjectItem(root, "cid");
-            const char *cid_str = (cid_item && cJSON_IsString(cid_item)) ? cid_item->valuestring : "unknown";
+            const char *cid_str = (cid_item && cJSON_IsString(cid_item)) ? cid_item->valuestring : NULL;
+
+            if (!cid_str) {
+                ESP_LOGW(TAG, "Command rejected: missing cid");
+                cJSON_Delete(root);
+                return;
+            }
 
             cJSON *act_item = cJSON_GetObjectItem(root, "action");
             if (act_item && cJSON_IsString(act_item)) {
@@ -408,19 +408,25 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                 }
                             } 
                             else if (strcmp(mode_str, "pwm") == 0) {
-                                cJSON *duty_item = cJSON_GetObjectItem(root, "duty");
-                                if (duty_item && cJSON_IsNumber(duty_item)) {
+                                cJSON *state_item = cJSON_GetObjectItem(root, "state");
+                                cJSON *duty_item  = cJSON_GetObjectItem(root, "duty");
+
+                                if (state_item && cJSON_IsNumber(state_item) && state_item->valueint == 0) {
+                                    ledc_set_duty(ACTUATOR_LEDC_MODE, mapped_chan, 0);
+                                    ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
+                                    actuator_active_state = false;
+                                    ESP_LOGI(TAG, "PWM: OUT%d -> STOP (explicit state:0)", target_idx + 1);
+                                }
+                                else if (duty_item && cJSON_IsNumber(duty_item)) {
                                     int duty_val = duty_item->valueint;
                                     actuator_active_state = (duty_val > 0);
-                                    
                                     ledc_set_duty(ACTUATOR_LEDC_MODE, mapped_chan, duty_val);
                                     ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
-                                    ESP_LOGI(TAG, "PWM: OUT%d (GPIO %d) -> Duty: %d/255 [Duration: %d ms]", 
+                                    ESP_LOGI(TAG, "PWM: OUT%d (GPIO %d) -> Duty: %d/255 [Duration: %d ms]",
                                              target_idx + 1, mapped_gpio, duty_val, duration_ms);
                                 }
                             }
                             
-                            // Dynamic Override & Safe Task Cancellation Logic
                             if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
                                 if (auto_shutoff_task_handles[target_idx] != NULL) {
                                     vTaskDelete(auto_shutoff_task_handles[target_idx]);
@@ -430,13 +436,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                 xSemaphoreGive(task_tracking_mutex);
                             }
 
-                            // State Routing Framework
                             if (actuator_active_state) {
                                 if (duration_ms > 0) {
-                                    // Case A: Driven ON using a dynamic auto-shutoff execution window
                                     send_command_ack(cid_str, "started", "Actuator driven high, auto-shutoff armed");
                                     
-                                    // STATIC ALLOCATION: Safely overwriting permanent global memory
                                     global_timer_args[target_idx].target_idx = target_idx;
                                     global_timer_args[target_idx].duration_ms = duration_ms;
                                     strncpy(global_timer_args[target_idx].cid, cid_str, sizeof(global_timer_args[target_idx].cid) - 1);
@@ -447,17 +450,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                         xSemaphoreGive(task_tracking_mutex);
                                     }
                                 } else {
-                                    // Case B: Driven ON indefinitely 
                                     send_command_ack(cid_str, "started", "Actuator driven high indefinitely");
                                 }
                             } else {
-                                // Case C: Explicitly driven LOW (Turned OFF)
                                 send_command_ack(cid_str, "stopped", "Actuator set to default idle state");
                             }
                             
-                            // ==========================================
-                            // MEMORY TRACKER - Validating execution safety
-                            // ==========================================
                             ESP_LOGW(TAG, "CURRENT FREE RAM: %" PRIu32 " bytes", esp_get_free_heap_size());
                             
                         } else {
@@ -519,13 +517,6 @@ static void obtain_time(void) {
 }
 
 static void network_init(void) {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -706,11 +697,8 @@ void telemetry_builder_task(void *pvParameter) {
         cJSON *root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "t", "tlm");
         cJSON_AddNumberToObject(root, "v", 1);
-        cJSON_AddStringToObject(root, "tid", "tenant-123");
-        
-        // Updated to use dynamic node_id
+        cJSON_AddStringToObject(root, "tid", tenant_id);
         cJSON_AddStringToObject(root, "nid", node_id);
-        
         cJSON_AddNumberToObject(root, "ts", (double)time(NULL));
 
         cJSON *adc_array = cJSON_AddArrayToObject(root, "adc");
@@ -741,14 +729,13 @@ void telemetry_builder_task(void *pvParameter) {
 
         char *payload_string = cJSON_PrintUnformatted(root);
         if (mqtt_client != NULL && payload_string != NULL) {
-            // Updated to use dynamic topic_tlm
             esp_mqtt_client_publish(mqtt_client, topic_tlm, payload_string, 0, 1, 0);
             ESP_LOGI(TAG, "Telemetry Payload Dispatched: %s", payload_string);
         }
         free(payload_string);
         cJSON_Delete(root);
 
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_INTERVAL_MS));
     }
 }
 
@@ -762,6 +749,7 @@ static bool is_sensor_attached(int16_t raw_value) {
 
 void discovery_builder_task(void *pvParameter) {
     uint32_t last_detailed_topology = 0xFFFFFFFF; 
+    static TickType_t last_disco_publish = 0;
 
     while (1) {
         if (!is_mqtt_connected) {
@@ -810,21 +798,23 @@ void discovery_builder_task(void *pvParameter) {
             xSemaphoreGive(data_mutex);
         }
 
-        if (current_detailed_topology == last_detailed_topology) {
+        bool topology_changed = (current_detailed_topology != last_detailed_topology);
+        bool heartbeat_due = (xTaskGetTickCount() - last_disco_publish) > pdMS_TO_TICKS(DISCOVERY_HEARTBEAT_MS);
+
+        if (!topology_changed && !heartbeat_due) {
             continue; 
         }
         
         last_detailed_topology = current_detailed_topology;
+        last_disco_publish = xTaskGetTickCount();
 
         cJSON *root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "t", "disco");
         cJSON_AddNumberToObject(root, "v", 1);
-        cJSON_AddStringToObject(root, "tid", "tenant-123");
-        
-        // Updated to use dynamic node_id
+        cJSON_AddStringToObject(root, "tid", tenant_id);
         cJSON_AddStringToObject(root, "nid", node_id);
-        
         cJSON_AddNumberToObject(root, "ts", (double)time(NULL));
+        cJSON_AddNumberToObject(root, "tlm_interval_ms", TELEMETRY_INTERVAL_MS);
 
         cJSON *bus_array = cJSON_AddArrayToObject(root, "buses");
         
@@ -858,7 +848,6 @@ void discovery_builder_task(void *pvParameter) {
 
         char *payload_string = cJSON_PrintUnformatted(root);
         if (mqtt_client != NULL && payload_string != NULL) {
-            // Updated to use dynamic topic_disco
             esp_mqtt_client_publish(mqtt_client, topic_disco, payload_string, 0, 1, 1);
             ESP_LOGW(TAG, "Topology Change Caught! New Discovery Packet Dispatched: %s", payload_string);
         }
@@ -871,7 +860,15 @@ void discovery_builder_task(void *pvParameter) {
 // 6. APP MAIN ENTRY
 // ==========================================
 void app_main(void) {
-    // Generate identity immediately on boot
+    // 1. Initialize NVS Flash FIRST so the tenant_id can be read securely
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // 2. NOW it is safe to read the MAC and load the Tenant from NVS
     init_dynamic_identity();
 
     i2c_mutex = xSemaphoreCreateMutex();
