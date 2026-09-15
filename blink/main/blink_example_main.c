@@ -1,4 +1,3 @@
-
 /**
  * Project: Environment-Agnostic IoT Monitoring Framework
  * Author: Korinne Margaret V. Sasil, Mikhail Alexi D. Hatulan
@@ -9,6 +8,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -18,6 +18,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
+#include "nvs.h" 
 #include "mqtt_client.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
@@ -25,23 +26,25 @@
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
 #include "cJSON.h"
+#include "esp_mac.h" 
+
+#include "credentials.h"
+
+static const char *TAG = "THESIS_NODE";
+
+#define TELEMETRY_INTERVAL_MS   10000
+#define DISCOVERY_HEARTBEAT_MS  60000
 
 // ==========================================
-// 1. CREDENTIALS & TOPICS
+// DYNAMIC TOPIC & ID BUFFERS
 // ==========================================
-#define WIFI_SSID                   "Hello"
-#define WIFI_PASS                   "oof000fo"
-
-#define MQTT_BROKER_URI             "mqtts://10.136.54.162:8883"
-#define MQTT_USERNAME               "esp32_client"
-#define MQTT_PASSWORD               "pass1234"
-#define MQTT_DISCO_TOPIC            "usc/thesis/tenant-123/N001/disco" 
-#define DISCOVERY_INTERVAL_MS       (10 * 1000) 
-#define MQTT_TOPIC                  "usc/thesis/tenant-123/N001/tlm"
-#define MQTT_CMD_TOPIC              "usc/thesis/tenant-123/N001/cmd"
-#define MQTT_ACK_TOPIC              "usc/thesis/tenant-123/N001/ack"
-
-static const char *TAG = "THESIS_NODE_N001";
+char node_id[32];
+char tenant_id[32];
+char topic_tlm[128];
+char topic_cmd[128];
+char topic_ack[128];
+char topic_disco[128];
+char topic_status[128]; // Buffer added for LWT status
 
 #define FLOATING_LEAK_MIN   4500
 #define FLOATING_LEAK_MAX   5000
@@ -51,7 +54,7 @@ static const char *TAG = "THESIS_NODE_N001";
 // ==========================================
 #define NUM_ACTUATORS       6  
 
-const int actuator_gpios[NUM_ACTUATORS] = {4, 5, 13, 14, 16, 17}; 
+const int actuator_gpios[NUM_ACTUATORS] = {4, 25, 13, 14, 16, 17};
 
 const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
     LEDC_CHANNEL_0,
@@ -68,34 +71,10 @@ const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
 #define ACTUATOR_LEDC_FREQ          5000               
 
 // ==========================================
-// 3. MOSQUITTO ROOT CA
-// ==========================================
-static const char *mosqmq_root_ca =
-"-----BEGIN CERTIFICATE-----\n"
-"MIIDETCCAfmgAwIBAgIUDf39/NPvfdRYZlvpVCoiLhRF9McwDQYJKoZIhvcNAQEL\n"
-"BQAwGDEWMBQGA1UEAwwNTXlMb2NhbFJvb3RDQTAeFw0yNjA3MTUwNTI1NDRaFw0z\n"
-"NjA3MTIwNTI1NDRaMBgxFjAUBgNVBAMMDU15TG9jYWxSb290Q0EwggEiMA0GCSqG\n"
-"SIb3DQEBAQUAA4IBDwAwggEKAoIBAQDsMINZ1TB557Tk44B1XLfncup0v93tm2vw\n"
-"UnCmTXtHytsKPRHjLfaGJ2ADJEoibERY9qNsnoECvIr9q8uPTYonrCv0lY3gVvBg\n"
-"LpMVLM5aIQqgfuhW5EK6iJ0KaXDxSUz+1zX4Djvqy8vs5rMsVZbSKvPoaXS5+20p\n"
-"Wwx4YYiz7fOBErFBWpmLZnGwGaxJzUGA27JADvGE/dGVhp2ptJ7a2kqqlIrc/5Xs\n"
-"TroGge7iv3dt8mEKHv2Zr0T8/aoFOYs8LYMiin8bdzU+f8o+cuHKUrCBR9yx3X0q\n"
-"68MBlPHKEkIO00rNif27+/Fgmwn1HXNZSpgTNcy/xzbP0saTyqhFAgMBAAGjUzBR\n"
-"MB0GA1UdDgQWBBQZd6noDe1fqe5ycvdVd3MZfgD3PjAfBgNVHSMEGDAWgBQZd6no\n"
-"De1fqe5ycvdVd3MZfgD3PjAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\n"
-"A4IBAQDOWakED1k49pyEHNehrzOAnycMKdtOFtOy30mFNFpWsFgGcyC1Bod4wuO8\n"
-"3V30NfOQbrL9t5punEz410dWaiQ6vIL5Fw3rWYDcEYpSNdjGxhECnGTIoh7peb55\n"
-"ShLQFx75IvgvezD3SK3YP2hM6DbvicCKMkk90a9FdIqCsSH4Pl+oKzHWu50P1gV4\n"
-"FCZ+3vDBHf9v/JqEy555zDRGNKql+ulbM40F2CkB8vljrI2cdUMTz/dsgqc8KIGy\n"
-"RyBJHcOHNj8iInQTtbgyEsJPkV4D3MA1u4Y238kGNrCj3O4i6ejzi5kQUunIvtX+\n"
-"PwjIMuh1hKDNc8Raxz+8S6S+iXw2\n"
-"-----END CERTIFICATE-----\n";
-
-// ==========================================
 // 4. HARDWARE CONSTANTS & GLOBAL STATE
 // ==========================================
-#define I2C_MASTER_SDA_IO           11
-#define I2C_MASTER_SCL_IO           12
+#define I2C_MASTER_SDA_IO           21
+#define I2C_MASTER_SCL_IO           22
 #define I2C_MASTER_FREQ_HZ          100000
 #define REG_POINTER_CONVERT         0x00
 #define REG_POINTER_CONFIG          0x01
@@ -134,10 +113,45 @@ typedef struct {
 
 NodeData global_node_data[4];
 
-// Track background auto-shutoff task handles per actuator port
+typedef struct {
+    int target_idx;
+    int duration_ms;
+    char cid[64];
+} auto_shutoff_args_t;
+
 TaskHandle_t auto_shutoff_task_handles[NUM_ACTUATORS] = {NULL, NULL, NULL, NULL, NULL, NULL};
+auto_shutoff_args_t global_timer_args[NUM_ACTUATORS]; 
 
 static esp_err_t i2c_master_init(void);
+
+// ==========================================
+// DYNAMIC NODE ID GENERATION
+// ==========================================
+static void init_dynamic_identity(void) {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    
+    sprintf(node_id, "NODE-%02X%02X%02X", mac[3], mac[4], mac[5]);
+    
+    strcpy(tenant_id, DEFAULT_TENANT_ID);
+    nvs_handle_t h;
+    if (nvs_open("senseable", NVS_READONLY, &h) == ESP_OK) {
+        size_t len = sizeof(tenant_id);
+        nvs_get_str(h, "tenant_id", tenant_id, &len);
+        nvs_close(h);
+    }
+    
+    sprintf(topic_tlm,   "%s/%s/%s/tlm",   MQTT_TOPIC_ROOT, tenant_id, node_id);
+    sprintf(topic_cmd,   "%s/%s/%s/cmd",   MQTT_TOPIC_ROOT, tenant_id, node_id);
+    sprintf(topic_ack,   "%s/%s/%s/ack",   MQTT_TOPIC_ROOT, tenant_id, node_id);
+    sprintf(topic_disco, "%s/%s/%s/disco", MQTT_TOPIC_ROOT, tenant_id, node_id);
+    sprintf(topic_status, "%s/%s/%s/status", MQTT_TOPIC_ROOT, tenant_id, node_id); // Initialize LWT Topic
+    
+    ESP_LOGI(TAG, "====================================");
+    ESP_LOGI(TAG, "PROVISIONED AS: %s / %s", tenant_id, node_id);
+    ESP_LOGI(TAG, "Command Topic: %s", topic_cmd);
+    ESP_LOGI(TAG, "====================================");
+}
 
 // ==========================================
 // ENHANCED TWO-STEP ACKNOWLEDGEMENT LOGIC
@@ -148,18 +162,12 @@ static void send_command_ack(const char *cid, const char *status, const char *de
     }
 
     cJSON *ack_root = cJSON_CreateObject();
-    if (ack_root == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate memory for ACK JSON structure.");
-        return;
-    }
+    if (ack_root == NULL) return;
 
-    // Standardized global metadata block matching system architecture
     cJSON_AddStringToObject(ack_root, "t", "ack");
     cJSON_AddNumberToObject(ack_root, "v", 1);
-    cJSON_AddStringToObject(ack_root, "tid", "tenant-123");
-    cJSON_AddStringToObject(ack_root, "nid", "N001");
-    
-    // Command validation context
+    cJSON_AddStringToObject(ack_root, "tid", tenant_id);
+    cJSON_AddStringToObject(ack_root, "nid", node_id);
     cJSON_AddStringToObject(ack_root, "cid", cid ? cid : "unknown");
     cJSON_AddStringToObject(ack_root, "status", status);
     cJSON_AddStringToObject(ack_root, "details", details ? details : "");
@@ -167,7 +175,7 @@ static void send_command_ack(const char *cid, const char *status, const char *de
 
     char *payload = cJSON_PrintUnformatted(ack_root);
     if (payload != NULL) {
-        esp_mqtt_client_publish(mqtt_client, MQTT_ACK_TOPIC, payload, 0, 1, 0);
+        esp_mqtt_client_publish(mqtt_client, topic_ack, payload, 0, 1, 0);
         ESP_LOGI(TAG, "Command ACK published -> Status: %s | ID: %s", status, cid ? cid : "unknown");
         free(payload);
     }
@@ -267,37 +275,26 @@ static void init_actuators(void) {
 // ==========================================
 // BACKGROUND AUTO-SHUTOFF TIMER
 // ==========================================
-typedef struct {
-    int target_idx;
-    int duration_ms;
-    char cid[64];
-} auto_shutoff_args_t;
-
 void auto_shutoff_task(void *pvParameter) {
     auto_shutoff_args_t *args = (auto_shutoff_args_t *)pvParameter;
     
-    // Hold execution context safely during the dynamic delay window
     vTaskDelay(pdMS_TO_TICKS(args->duration_ms));
     
     int mapped_gpio = actuator_gpios[args->target_idx];
     ledc_channel_t mapped_chan = actuator_channels[args->target_idx];
     
-    // Force target physical terminal to ground state
     ledc_stop(ACTUATOR_LEDC_MODE, mapped_chan, 0);
     gpio_set_level(mapped_gpio, 0);
     
     ESP_LOGW(TAG, ">>> Auto-shutoff triggered for OUT%d after %d ms <<<", args->target_idx + 1, args->duration_ms);
     
-    // Issue the second-step deferred execution completion response
     send_command_ack(args->cid, "completed", "Auto-shutoff execution window expired safely");
 
-    // Clean tracking structures thread-safely before self-deletion
     if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
         auto_shutoff_task_handles[args->target_idx] = NULL;
         xSemaphoreGive(task_tracking_mutex);
     }
 
-    free(args);
     vTaskDelete(NULL);
 }
 
@@ -340,156 +337,169 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "SUCCESS! Secure TLS Connection to Mosquitto Established!");
         is_mqtt_connected = true;
         xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
-        esp_mqtt_client_subscribe(client, MQTT_CMD_TOPIC, 1);
+        
+        esp_mqtt_client_subscribe(client, topic_cmd, 1);
+        
+        // Publish online status to overwrite any retained offline messages
+        esp_mqtt_client_publish(client, topic_status, "{\"t\":\"lwt\",\"status\":\"online\"}", 0, 1, 1);
     } 
     else if (event_id == MQTT_EVENT_DISCONNECTED) {
         ESP_LOGW(TAG, "MQTT Broker Disconnected.");
         is_mqtt_connected = false;
     } 
     else if (event_id == MQTT_EVENT_DATA) {
-        char *json_string = malloc(event->data_len + 1);
-        if (json_string) {
-            memcpy(json_string, event->data, event->data_len);
-            json_string[event->data_len] = '\0';
+        
+        if (event->data_len >= 1024) {
+            ESP_LOGE(TAG, "Payload exceeds stack buffer size. Dropping packet.");
+            return;
+        }
+
+        char json_string[1024];
+        memcpy(json_string, event->data, event->data_len);
+        json_string[event->data_len] = '\0';
             
-            cJSON *root = cJSON_Parse(json_string);
-            if (root) {
-                cJSON *cid_item = cJSON_GetObjectItem(root, "cid");
-                const char *cid_str = (cid_item && cJSON_IsString(cid_item)) ? cid_item->valuestring : "unknown";
+        cJSON *root = cJSON_Parse(json_string);
+        if (root) {
+            cJSON *cid_item = cJSON_GetObjectItem(root, "cid");
+            const char *cid_str = (cid_item && cJSON_IsString(cid_item)) ? cid_item->valuestring : NULL;
 
-                cJSON *act_item = cJSON_GetObjectItem(root, "action");
-                if (act_item && cJSON_IsString(act_item)) {
-                    const char *action = act_item->valuestring;
+            if (!cid_str) {
+                ESP_LOGW(TAG, "Command rejected: missing cid");
+                cJSON_Delete(root);
+                return;
+            }
+
+            cJSON *act_item = cJSON_GetObjectItem(root, "action");
+            if (act_item && cJSON_IsString(act_item)) {
+                const char *action = act_item->valuestring;
+                
+                if (strcmp(action, "bus_recovery") == 0) {
+                    cJSON *bus_id_item = cJSON_GetObjectItem(root, "bus_id");
+                    int target_bus = (bus_id_item && cJSON_IsNumber(bus_id_item)) ? bus_id_item->valueint : 0;
                     
-                    if (strcmp(action, "bus_recovery") == 0) {
-                        cJSON *bus_id_item = cJSON_GetObjectItem(root, "bus_id");
-                        int target_bus = (bus_id_item && cJSON_IsNumber(bus_id_item)) ? bus_id_item->valueint : 0;
-                        
-                        ESP_LOGI(TAG, "Schema payload validated for Bus %d. Executing recovery routine...", target_bus);
-                        send_command_ack(cid_str, "started", "Beginning I2C recovery cycle");
-                        recover_i2c_bus();
-                        xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
-                        send_command_ack(cid_str, "completed", "I2C bus recovery complete");
-                    } 
+                    ESP_LOGI(TAG, "Schema payload validated for Bus %d. Executing recovery routine...", target_bus);
+                    send_command_ack(cid_str, "started", "Beginning I2C recovery cycle");
+                    recover_i2c_bus();
+                    xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+                    send_command_ack(cid_str, "completed", "I2C bus recovery complete");
+                } 
+                
+                else if (strcmp(action, "actuate") == 0) {
+                    cJSON *port_item = cJSON_GetObjectItem(root, "port");
+                    cJSON *mode_item = cJSON_GetObjectItem(root, "mode");
+                    cJSON *dur_item = cJSON_GetObjectItem(root, "dur"); 
                     
-                    else if (strcmp(action, "actuate") == 0) {
-                        cJSON *port_item = cJSON_GetObjectItem(root, "port");
-                        cJSON *mode_item = cJSON_GetObjectItem(root, "mode");
-                        cJSON *dur_item = cJSON_GetObjectItem(root, "dur"); 
+                    if (port_item && mode_item && dur_item && cJSON_IsNumber(port_item) && cJSON_IsString(mode_item)) {
                         
-                        if (port_item && mode_item && dur_item && cJSON_IsNumber(port_item) && cJSON_IsString(mode_item)) {
+                        int target_idx = port_item->valueint - 1; 
+                        const char *mode_str = mode_item->valuestring;
+                        int duration_ms = cJSON_IsNumber(dur_item) ? dur_item->valueint : 0;
+
+                        if (target_idx >= 0 && target_idx < NUM_ACTUATORS) { 
+                            int mapped_gpio = actuator_gpios[target_idx];
+                            ledc_channel_t mapped_chan = actuator_channels[target_idx];
+                            bool actuator_active_state = false;
+
+                            if (strcmp(mode_str, "bin") == 0) {
+                                cJSON *state_item = cJSON_GetObjectItem(root, "state");
+                                if (state_item && cJSON_IsNumber(state_item)) {
+                                    int state_val = state_item->valueint;
+                                    actuator_active_state = (state_val > 0);
+                                    
+                                    ledc_stop(ACTUATOR_LEDC_MODE, mapped_chan, state_val);
+                                    gpio_set_level(mapped_gpio, state_val);
+                                    ESP_LOGI(TAG, "Binary: OUT%d (GPIO %d) -> %d [Duration: %d ms]", 
+                                             target_idx + 1, mapped_gpio, state_val, duration_ms);
+                                }
+                            } 
+                            else if (strcmp(mode_str, "pwm") == 0) {
+                                cJSON *state_item = cJSON_GetObjectItem(root, "state");
+                                cJSON *duty_item  = cJSON_GetObjectItem(root, "duty");
+
+                                if (state_item && cJSON_IsNumber(state_item) && state_item->valueint == 0) {
+                                    ledc_set_duty(ACTUATOR_LEDC_MODE, mapped_chan, 0);
+                                    ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
+                                    actuator_active_state = false;
+                                    ESP_LOGI(TAG, "PWM: OUT%d -> STOP (explicit state:0)", target_idx + 1);
+                                }
+                                else if (duty_item && cJSON_IsNumber(duty_item)) {
+                                    int duty_val = duty_item->valueint;
+                                    actuator_active_state = (duty_val > 0);
+                                    ledc_set_duty(ACTUATOR_LEDC_MODE, mapped_chan, duty_val);
+                                    ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
+                                    ESP_LOGI(TAG, "PWM: OUT%d (GPIO %d) -> Duty: %d/255 [Duration: %d ms]",
+                                             target_idx + 1, mapped_gpio, duty_val, duration_ms);
+                                }
+                            }
                             
-                            int target_idx = port_item->valueint - 1; 
-                            const char *mode_str = mode_item->valuestring;
-                            int duration_ms = cJSON_IsNumber(dur_item) ? dur_item->valueint : 0;
-
-                            if (target_idx >= 0 && target_idx < NUM_ACTUATORS) { 
-                                int mapped_gpio = actuator_gpios[target_idx];
-                                ledc_channel_t mapped_chan = actuator_channels[target_idx];
-                                bool actuator_active_state = false;
-
-                                if (strcmp(mode_str, "bin") == 0) {
-                                    cJSON *state_item = cJSON_GetObjectItem(root, "state");
-                                    if (state_item && cJSON_IsNumber(state_item)) {
-                                        int state_val = state_item->valueint;
-                                        actuator_active_state = (state_val > 0);
-                                        
-                                        ledc_stop(ACTUATOR_LEDC_MODE, mapped_chan, state_val);
-                                        gpio_set_level(mapped_gpio, state_val);
-                                        ESP_LOGI(TAG, "Binary: OUT%d (GPIO %d) -> %d [Duration: %d ms]", 
-                                                 target_idx + 1, mapped_gpio, state_val, duration_ms);
-                                    }
-                                } 
-                                else if (strcmp(mode_str, "pwm") == 0) {
-                                    cJSON *duty_item = cJSON_GetObjectItem(root, "duty");
-                                    if (duty_item && cJSON_IsNumber(duty_item)) {
-                                        int duty_val = duty_item->valueint;
-                                        actuator_active_state = (duty_val > 0);
-                                        
-                                        ledc_set_duty(ACTUATOR_LEDC_MODE, mapped_chan, duty_val);
-                                        ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
-                                        ESP_LOGI(TAG, "PWM: OUT%d (GPIO %d) -> Duty: %d/255 [Duration: %d ms]", 
-                                                 target_idx + 1, mapped_gpio, duty_val, duration_ms);
-                                        ESP_LOGW(TAG, "CURRENT FREE RAM: %" PRIu32 " bytes", esp_get_free_heap_size());
-                                    }
+                            if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
+                                if (auto_shutoff_task_handles[target_idx] != NULL) {
+                                    vTaskDelete(auto_shutoff_task_handles[target_idx]);
+                                    auto_shutoff_task_handles[target_idx] = NULL;
+                                    ESP_LOGW(TAG, "Safely terminated legacy timed worker task on OUT%d to protect override context.", target_idx + 1);
                                 }
-                                
-                                // Dynamic Override & Safe Task Cancellation Logic
-                                if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
-                                    if (auto_shutoff_task_handles[target_idx] != NULL) {
-                                        vTaskDelete(auto_shutoff_task_handles[target_idx]);
-                                        auto_shutoff_task_handles[target_idx] = NULL;
-                                        ESP_LOGW(TAG, "Safely terminated legacy timed worker task on OUT%d to protect override context.", target_idx + 1);
-                                    }
-                                    xSemaphoreGive(task_tracking_mutex);
-                                }
+                                xSemaphoreGive(task_tracking_mutex);
+                            }
 
-                                // State Routing Framework
-                                if (actuator_active_state) {
-                                    if (duration_ms > 0) {
-                                        // Case A: Driven ON using a dynamic auto-shutoff execution window
-                                        send_command_ack(cid_str, "started", "Actuator driven high, auto-shutoff armed");
-                                        
-                                        auto_shutoff_args_t *args = malloc(sizeof(auto_shutoff_args_t));
-                                        if (args != NULL) {
-                                            args->target_idx = target_idx;
-                                            args->duration_ms = duration_ms;
-                                            strncpy(args->cid, cid_str, sizeof(args->cid) - 1);
-                                            args->cid[sizeof(args->cid) - 1] = '\0';
-                                            
-                                            if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
-                                                xTaskCreate(auto_shutoff_task, "auto_shutoff", 2048, (void *)args, 5, &auto_shutoff_task_handles[target_idx]);
-                                                xSemaphoreGive(task_tracking_mutex);
-                                            }
-                                        }
-                                    } else {
-                                        // Case B: Driven ON indefinitely (supports infinite duration sequence changes)
-                                        send_command_ack(cid_str, "started", "Actuator driven high indefinitely");
+                            if (actuator_active_state) {
+                                if (duration_ms > 0) {
+                                    send_command_ack(cid_str, "started", "Actuator driven high, auto-shutoff armed");
+                                    
+                                    global_timer_args[target_idx].target_idx = target_idx;
+                                    global_timer_args[target_idx].duration_ms = duration_ms;
+                                    strncpy(global_timer_args[target_idx].cid, cid_str, sizeof(global_timer_args[target_idx].cid) - 1);
+                                    global_timer_args[target_idx].cid[sizeof(global_timer_args[target_idx].cid) - 1] = '\0';
+                                    
+                                    if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
+                                        xTaskCreate(auto_shutoff_task, "auto_shutoff", 2048, (void *)&global_timer_args[target_idx], 5, &auto_shutoff_task_handles[target_idx]);
+                                        xSemaphoreGive(task_tracking_mutex);
                                     }
                                 } else {
-                                    // Case C: Explicitly driven LOW (Turned OFF)
-                                    send_command_ack(cid_str, "stopped", "Actuator set to default idle state");
+                                    send_command_ack(cid_str, "started", "Actuator driven high indefinitely");
                                 }
-                                
                             } else {
-                                ESP_LOGW(TAG, "Actuation rejected. Port '%d' out of bounds.", target_idx + 1);
-                                send_command_ack(cid_str, "failed", "Port limit out of bounds");
+                                send_command_ack(cid_str, "stopped", "Actuator set to default idle state");
                             }
-                        } else {
-                            send_command_ack(cid_str, "failed", "Missing dynamic execution parameters");
-                        }
-                    }
-
-                    else if (strcmp(action, "sensor_port_up") == 0 || strcmp(action, "sensor_port_down") == 0) {
-                        cJSON *chip_item = cJSON_GetObjectItem(root, "chip");
-                        cJSON *ch_item = cJSON_GetObjectItem(root, "ch");
-                        
-                        if (chip_item && ch_item && cJSON_IsNumber(chip_item) && cJSON_IsNumber(ch_item)) {
-                            int chip_idx = chip_item->valueint;
-                            int ch_idx = ch_item->valueint;
                             
-                            if (chip_idx >= 0 && chip_idx < 4 && ch_idx >= 0 && ch_idx < 4) {
-                                bool set_active = (strcmp(action, "sensor_port_up") == 0);
-                                send_command_ack(cid_str, "started", "Modifying software configuration states");
-                                
-                                if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
-                                    port_active[chip_idx][ch_idx] = set_active;
-                                    xSemaphoreGive(data_mutex);
-                                }
-                                ESP_LOGW(TAG, "Altered configuration: Chip Index [%d] Port [%d] -> %s", 
-                                         chip_idx, ch_idx, set_active ? "ENABLED" : "DISABLED");
-                                xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
-                                
-                                send_command_ack(cid_str, "completed", "Target port map dynamically adjusted");
-                            } else {
-                                send_command_ack(cid_str, "failed", "Chip or port argument range out of bounds");
+                            ESP_LOGW(TAG, "CURRENT FREE RAM: %" PRIu32 " bytes", esp_get_free_heap_size());
+                            
+                        } else {
+                            ESP_LOGW(TAG, "Actuation rejected. Port '%d' out of bounds.", target_idx + 1);
+                            send_command_ack(cid_str, "failed", "Port limit out of bounds");
+                        }
+                    } else {
+                        send_command_ack(cid_str, "failed", "Missing dynamic execution parameters");
+                    }
+                }
+
+                else if (strcmp(action, "sensor_port_up") == 0 || strcmp(action, "sensor_port_down") == 0) {
+                    cJSON *chip_item = cJSON_GetObjectItem(root, "chip");
+                    cJSON *ch_item = cJSON_GetObjectItem(root, "ch");
+                    
+                    if (chip_item && ch_item && cJSON_IsNumber(chip_item) && cJSON_IsNumber(ch_item)) {
+                        int chip_idx = chip_item->valueint;
+                        int ch_idx = ch_item->valueint;
+                        
+                        if (chip_idx >= 0 && chip_idx < 4 && ch_idx >= 0 && ch_idx < 4) {
+                            bool set_active = (strcmp(action, "sensor_port_up") == 0);
+                            send_command_ack(cid_str, "started", "Modifying software configuration states");
+                            
+                            if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
+                                port_active[chip_idx][ch_idx] = set_active;
+                                xSemaphoreGive(data_mutex);
                             }
+                            ESP_LOGW(TAG, "Altered configuration: Chip Index [%d] Port [%d] -> %s", 
+                                     chip_idx, ch_idx, set_active ? "ENABLED" : "DISABLED");
+                            xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+                            
+                            send_command_ack(cid_str, "completed", "Target port map dynamically adjusted");
+                        } else {
+                            send_command_ack(cid_str, "failed", "Chip or port argument range out of bounds");
                         }
                     }
                 }
-                cJSON_Delete(root);
             }
-            free(json_string);
+            cJSON_Delete(root);
         }
     }
 }
@@ -512,13 +522,6 @@ static void obtain_time(void) {
 }
 
 static void network_init(void) {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -547,6 +550,15 @@ static void network_init(void) {
         .credentials.username = MQTT_USERNAME,
         .credentials.authentication.password = MQTT_PASSWORD,
         .broker.verification.certificate = mosqmq_root_ca,
+        
+        // Last Will and Testament Configuration
+        .session.last_will.topic  = topic_status,
+        .session.last_will.msg    = "{\"t\":\"lwt\",\"status\":\"offline\"}",
+        .session.last_will.qos    = 1,
+        .session.last_will.retain = 1,
+        
+        // Lower keepalive for rapid offline detection
+        .session.keepalive = 15,
     };
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -641,7 +653,7 @@ void ads_reader_task(void *pvParameter) {
                 if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     esp_err_t tx_err = ESP_FAIL;
                     if (ads_handles[i] != NULL) {
-                        tx_err = i2c_master_transmit(ads_handles[i], config_data, sizeof(config_data), -1);
+                        tx_err = i2c_master_transmit(ads_handles[i], config_data, sizeof(config_data), 100);
                     }
                     xSemaphoreGive(i2c_mutex);
 
@@ -659,7 +671,7 @@ void ads_reader_task(void *pvParameter) {
                     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                         esp_err_t rx_err = ESP_FAIL;
                         if (ads_handles[i] != NULL) {
-                            rx_err = i2c_master_transmit_receive(ads_handles[i], &reg_pointer, 1, read_buf, sizeof(read_buf), -1);
+                            rx_err = i2c_master_transmit_receive(ads_handles[i], &reg_pointer, 1, read_buf, sizeof(read_buf), 100);
                         }
                         xSemaphoreGive(i2c_mutex);
 
@@ -699,8 +711,8 @@ void telemetry_builder_task(void *pvParameter) {
         cJSON *root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "t", "tlm");
         cJSON_AddNumberToObject(root, "v", 1);
-        cJSON_AddStringToObject(root, "tid", "tenant-123");
-        cJSON_AddStringToObject(root, "nid", "N001");
+        cJSON_AddStringToObject(root, "tid", tenant_id);
+        cJSON_AddStringToObject(root, "nid", node_id);
         cJSON_AddNumberToObject(root, "ts", (double)time(NULL));
 
         cJSON *adc_array = cJSON_AddArrayToObject(root, "adc");
@@ -731,13 +743,13 @@ void telemetry_builder_task(void *pvParameter) {
 
         char *payload_string = cJSON_PrintUnformatted(root);
         if (mqtt_client != NULL && payload_string != NULL) {
-            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload_string, 0, 1, 0);
+            esp_mqtt_client_publish(mqtt_client, topic_tlm, payload_string, 0, 1, 0);
             ESP_LOGI(TAG, "Telemetry Payload Dispatched: %s", payload_string);
         }
         free(payload_string);
         cJSON_Delete(root);
 
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_INTERVAL_MS));
     }
 }
 
@@ -751,6 +763,7 @@ static bool is_sensor_attached(int16_t raw_value) {
 
 void discovery_builder_task(void *pvParameter) {
     uint32_t last_detailed_topology = 0xFFFFFFFF; 
+    static TickType_t last_disco_publish = 0;
 
     while (1) {
         if (!is_mqtt_connected) {
@@ -799,18 +812,23 @@ void discovery_builder_task(void *pvParameter) {
             xSemaphoreGive(data_mutex);
         }
 
-        if (current_detailed_topology == last_detailed_topology) {
+        bool topology_changed = (current_detailed_topology != last_detailed_topology);
+        bool heartbeat_due = (xTaskGetTickCount() - last_disco_publish) > pdMS_TO_TICKS(DISCOVERY_HEARTBEAT_MS);
+
+        if (!topology_changed && !heartbeat_due) {
             continue; 
         }
         
         last_detailed_topology = current_detailed_topology;
+        last_disco_publish = xTaskGetTickCount();
 
         cJSON *root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "t", "disco");
         cJSON_AddNumberToObject(root, "v", 1);
-        cJSON_AddStringToObject(root, "tid", "tenant-123");
-        cJSON_AddStringToObject(root, "nid", "N001");
+        cJSON_AddStringToObject(root, "tid", tenant_id);
+        cJSON_AddStringToObject(root, "nid", node_id);
         cJSON_AddNumberToObject(root, "ts", (double)time(NULL));
+        cJSON_AddNumberToObject(root, "tlm_interval_ms", TELEMETRY_INTERVAL_MS);
 
         cJSON *bus_array = cJSON_AddArrayToObject(root, "buses");
         
@@ -844,7 +862,7 @@ void discovery_builder_task(void *pvParameter) {
 
         char *payload_string = cJSON_PrintUnformatted(root);
         if (mqtt_client != NULL && payload_string != NULL) {
-            esp_mqtt_client_publish(mqtt_client, MQTT_DISCO_TOPIC, payload_string, 0, 1, 1);
+            esp_mqtt_client_publish(mqtt_client, topic_disco, payload_string, 0, 1, 1);
             ESP_LOGW(TAG, "Topology Change Caught! New Discovery Packet Dispatched: %s", payload_string);
         }
         free(payload_string);
@@ -856,6 +874,17 @@ void discovery_builder_task(void *pvParameter) {
 // 6. APP MAIN ENTRY
 // ==========================================
 void app_main(void) {
+    // 1. Initialize NVS Flash FIRST so the tenant_id can be read securely
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // 2. NOW it is safe to read the MAC and load the Tenant from NVS
+    init_dynamic_identity();
+
     i2c_mutex = xSemaphoreCreateMutex();
     data_mutex = xSemaphoreCreateMutex();
     task_tracking_mutex = xSemaphoreCreateMutex();
@@ -876,5 +905,3 @@ void app_main(void) {
 
     network_init();
 }
-
-
