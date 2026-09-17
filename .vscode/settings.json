@@ -56,5 +56,6 @@
   "C_Cpp_Runner.showCompilationTime": false,
   "C_Cpp_Runner.useLinkTimeOptimization": false,
   "C_Cpp_Runner.msvcSecureNoWarnings": false,
-  "idf.currentSetup": "C:\\esp\\v6.0.1\\esp-idf"
+  "idf.currentSetup": "C:\\esp\\v6.0.1\\esp-idf",
+  "cmake.sourceDirectory": "C:/Users/Miko/Documents/Git Clones/SENSEable-HW/blink"
 }

@@ -5,7 +5,7 @@ import time
 import uuid
 import paho.mqtt.client as mqtt
 
-MQTT_HOST = "10.66.206.162"
+MQTT_HOST = "10.136.54.162"
 MQTT_PORT = 8883
 MQTT_USER = "admin_user"
 MQTT_PASS = "adminpass1234"
