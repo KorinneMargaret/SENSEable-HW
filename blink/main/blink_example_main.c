@@ -42,14 +42,16 @@ static const char *TAG = "THESIS_NODE";
 
 #define TELEMETRY_INTERVAL_MS   10000
 #define DISCOVERY_HEARTBEAT_MS  60000
-#define PROVISION_BTN_GPIO      0       // Boot button to force Captive Portal
+
+// Slide Switch GPIO Assignment (GND = Config Mode, HIGH/PULLUP = Normal Operation)
+#define PROVISION_SWITCH_GPIO   0       
 
 // Maximum cloud reconnect failures before shifting route
 #define MAX_CLOUD_FAILURES      3       
 
 // Exponential backoff parameters for Cloud Ping Task
-#define MIN_PING_INTERVAL_SEC   300     // 5 minutes[cite: 2]
-#define MAX_PING_INTERVAL_SEC   3600    // 60 minutes[cite: 2]
+#define MIN_PING_INTERVAL_SEC   300     
+#define MAX_PING_INTERVAL_SEC   3600    
 
 // ==========================================
 // SYSTEM ENUMS & STATE STORAGE
@@ -171,7 +173,7 @@ static const char captive_portal_html[] =
 ".card{background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);max-width:400px;margin:auto;}"
 "h2{color:#333;}label{font-weight:bold;display:block;margin-top:10px;}"
 "input,select{width:100%;padding:8px;margin-top:4px;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;}"
-"button{margin-top:15px;width:100%;background:#007bff;color:#fff;border:none;padding:10px;border-radius:4px;font-size:16px;cursor:pointer;}"
+"button{margin-top:15px;width:100%;background:#007bff;color:#fff;border:none;padding:10px;border-radius:4px;font-size:16px;cursor:cursor;}"
 "button:hover{background:#0056b3;}</style></head><body>"
 "<div class='card'><h2>Node Setup</h2>"
 "<form action='/save' method='POST'>"
@@ -213,20 +215,20 @@ static void dns_server_task(void *pvParameters) {
     while (1) {
         int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&ra, &addr_len);
         if (len > 12) {
-            rx_buffer[2] |= 0x80; // Set response flag
+            rx_buffer[2] |= 0x80; 
             rx_buffer[3] |= 0x80;
-            rx_buffer[7] = 1;     // Answer count = 1
+            rx_buffer[7] = 1;     
             
             uint8_t reply[128];
             memcpy(reply, rx_buffer, len);
             int idx = len;
-            reply[idx++] = 0xc0; reply[idx++] = 0x0c; // Pointer to name
-            reply[idx++] = 0x00; reply[idx++] = 0x01; // Type A
-            reply[idx++] = 0x00; reply[idx++] = 0x01; // Class IN
-            reply[idx++] = 0x00; reply[idx++] = 0x00; // TTL
+            reply[idx++] = 0xc0; reply[idx++] = 0x0c; 
+            reply[idx++] = 0x00; reply[idx++] = 0x01; 
+            reply[idx++] = 0x00; reply[idx++] = 0x01; 
+            reply[idx++] = 0x00; reply[idx++] = 0x00; 
             reply[idx++] = 0x00; reply[idx++] = 0x3c;
-            reply[idx++] = 0x00; reply[idx++] = 0x04; // Data length 4
-            reply[idx++] = 192;  reply[idx++] = 168;  // IP: 192.168.4.1
+            reply[idx++] = 0x00; reply[idx++] = 0x04; 
+            reply[idx++] = 192;  reply[idx++] = 168;  
             reply[idx++] = 4;    reply[idx++] = 1;
 
             sendto(sock, reply, idx, 0, (struct sockaddr *)&ra, addr_len);
@@ -281,7 +283,7 @@ static esp_err_t http_save_handler(httpd_req_t *req) {
 }
 
 static void start_captive_portal(void) {
-    ESP_LOGW(TAG, "Starting Access Point Provisioning Portal...");
+    ESP_LOGW(TAG, "Slide switch in CONFIG mode. Starting Provisioning Portal...");
     esp_netif_create_default_wifi_ap();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
@@ -331,14 +333,21 @@ static void load_nvs_credentials(void) {
     strcpy(tenant_id, DEFAULT_TENANT_ID);
     current_hw_mode = HW_MODE_WIFI;
 
-    gpio_config_t btn_cfg = {
-        .pin_bit_mask = (1ULL << PROVISION_BTN_GPIO),
+    // Configure Slide Switch Pin with Internal Pull-up
+    gpio_config_t switch_cfg = {
+        .pin_bit_mask = (1ULL << PROVISION_SWITCH_GPIO),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
     };
-    gpio_config(&btn_cfg);
+    gpio_config(&switch_cfg);
 
-    bool force_portal = (gpio_get_level(PROVISION_BTN_GPIO) == 0);
+    // Give time for pin voltage levels to settle
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // If switch is flipped to LOW (grounded), enter Provisioning Mode directly
+    bool force_portal = (gpio_get_level(PROVISION_SWITCH_GPIO) == 0);
 
     if (nvs_open("senseable", NVS_READONLY, &h) == ESP_OK) {
         size_t len;
@@ -359,11 +368,13 @@ static void load_nvs_credentials(void) {
         }
         nvs_close(h);
     } else {
+        // NVS partition uninitialized or missing parameters
         force_portal = true;
     }
 
     if (force_portal) {
         start_captive_portal();
+        // Hold execution inside captive portal mode indefinitely
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -394,7 +405,6 @@ static bool test_cloud_socket_connection(void) {
     char host[64] = {0};
     int port = 1883; 
 
-    // Extract hostname and port from URI
     const char *uri_ptr = pri_broker_uri;
     if (strncmp(uri_ptr, "mqtt://", 7) == 0) {
         uri_ptr += 7;
@@ -750,14 +760,12 @@ static void configure_mqtt_client(void) {
         mqtt_cfg.broker.address.uri = pri_broker_uri;
         mqtt_cfg.credentials.username = pri_username;
         mqtt_cfg.credentials.authentication.password = pri_password;
-        // Primary Cloud Broker uses Non-TLS, Certificate set to NULL
         mqtt_cfg.broker.verification.certificate = NULL; 
     } else {
         ESP_LOGW(TAG, "Configuring MQTT Engine -> Local Edge Broker (%s)", sec_broker_uri);
         mqtt_cfg.broker.address.uri = sec_broker_uri;
         mqtt_cfg.credentials.username = sec_username;
         mqtt_cfg.credentials.authentication.password = sec_password;
-        // Local Edge Mosquitto uses TLS with Root CA Verification
         mqtt_cfg.broker.verification.certificate = mosqmq_root_ca; 
     }
 
@@ -805,7 +813,6 @@ static void network_init(void) {
         // Place cellular PPP network interface setup logic here
     }
 
-    // Initialize MQTT client state engine
     configure_mqtt_client();
 }
 
@@ -1114,7 +1121,7 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 2. Fetch NVS configuration parameters or open Captive Portal
+    // 2. Fetch NVS configuration parameters or enter AP mode if switch is grounded
     load_nvs_credentials();
     init_dynamic_identity();
 
