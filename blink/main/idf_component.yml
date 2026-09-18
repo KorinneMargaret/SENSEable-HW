@@ -1,3 +1,6 @@
 dependencies:
-  espressif/cjson: "*"
+  idf: ">=6.0"
   espressif/mqtt: "*"
+  espressif/cjson: "*"
+  joltwallet/littlefs: "*"
+  espressif/esp_modem: "*"
