@@ -37,6 +37,7 @@
 #include "esp_modem_api.h"
 
 #include "credentials.h"
+#include "lwip/dns.h"  
 
 static const char *TAG = "THESIS_NODE";
 
@@ -426,6 +427,11 @@ static void configure_mqtt_client(void) {
     }
 
     esp_mqtt_client_config_t mqtt_cfg = {0};
+    
+    // --- ESP-IDF v6 Network Timeout ---
+    mqtt_cfg.network.timeout_ms = 30000; 
+    // ----------------------------------
+
     mqtt_cfg.broker.address.uri = pri_broker_uri;
     if (strncmp(pri_broker_uri, "mqtts://", strlen("mqtts://")) == 0) {
         mqtt_cfg.broker.verification.certificate = mosqmq_root_ca;
@@ -441,10 +447,20 @@ static void configure_mqtt_client(void) {
 // ==========================================
 // CELLULAR (A7670C over PPP)
 // ==========================================
+
 static void ppp_ip_event_handler(void *arg, esp_event_base_t base, int32_t event_id, void *event_data) {
     if (event_id == IP_EVENT_PPP_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Cellular PPP up. IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        
+        // --- FORCE GOOGLE DNS (ESP-IDF v6 Compatible) ---
+        esp_netif_dns_info_t dns_info = {0};
+        dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+        esp_netif_str_to_ip4("8.8.8.8", &dns_info.ip.u_addr.ip4);
+        esp_netif_set_dns_info(ppp_netif, ESP_NETIF_DNS_MAIN, &dns_info);
+        ESP_LOGI(TAG, "Forced Google DNS (8.8.8.8) to bypass carrier DNS failure.");
+        // ------------------------
+
         xEventGroupSetBits(s_network_event_group, PPP_CONNECTED_BIT);
     } else if (event_id == IP_EVENT_PPP_LOST_IP) {
         ESP_LOGW(TAG, "Cellular PPP lost IP.");
