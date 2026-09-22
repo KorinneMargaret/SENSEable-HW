@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
 #include <inttypes.h>
 #include <sys/stat.h>
 
@@ -82,7 +83,7 @@ volatile bool is_mqtt_connected = false;
 char wifi_ssid[64];
 char wifi_pass[64];
 char pri_broker_uri[128] = MQTT_BROKER_URI;
-char sec_broker_uri[128] = "mqtt://local_mosquitto_ip:1883";
+char sec_broker_uri[128] = SEC_BROKER_URI;
 
 // ==========================================
 // I2C & HARDWARE GLOBALS
@@ -139,7 +140,7 @@ static esp_err_t i2c_master_init(void);
 // ==========================================
 static void init_dynamic_identity(void) {
     uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_BASE); // Uses EFUSE base MAC
+    esp_read_mac(mac, ESP_MAC_BASE); 
     sprintf(node_id, "NODE-%02X%02X%02X", mac[3], mac[4], mac[5]);
 
     #if ENABLE_HARDCODED_TESTING
@@ -254,7 +255,6 @@ static void recover_i2c_bus(void) {
         vTaskDelay(pdMS_TO_TICKS(5));
 
         if (i2c_master_init() == ESP_OK) {
-            // Must re-register the RTC after recreating the bus so time isn't lost!
             i2c_device_config_t ds_cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = DS3231_ADDR, .scl_speed_hz = I2C_MASTER_FREQ_HZ };
             i2c_master_bus_add_device(bus_handle, &ds_cfg, &ds3231_handle);
             ESP_LOGI(TAG, "Hardware core I2C registers and RTC restored.");
@@ -407,16 +407,27 @@ void ads_reader_task(void *pvParameter) {
 // ==========================================
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     if (event_id == MQTT_EVENT_CONNECTED) {
-        ESP_LOGI(TAG, "MQTT Connected! Route: CLOUD");
+        ESP_LOGI(TAG, "MQTT Connected! Route: %s", current_route_state == ROUTE_CLOUD ? "CLOUD" : "LOCAL");
         is_mqtt_connected = true;
         cloud_disconnect_count = 0;
         xEventGroupSetBits(s_network_event_group, MQTT_CONNECTED_BIT);
-        xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT); // Trigger disco on reconnect
+        xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT); 
     }
     else if (event_id == MQTT_EVENT_DISCONNECTED) {
         ESP_LOGW(TAG, "MQTT Disconnected.");
         is_mqtt_connected = false;
         xEventGroupClearBits(s_network_event_group, MQTT_CONNECTED_BIT);
+
+        if (current_hw_mode == HW_MODE_WIFI && current_route_state == ROUTE_CLOUD) {
+            cloud_disconnect_count++;
+            ESP_LOGW(TAG, "Cloud connection attempt %d failed.", cloud_disconnect_count);
+            
+            if (cloud_disconnect_count >= MAX_CLOUD_FAILURES) {
+                ESP_LOGE(TAG, "Cloud unreachable. Triggering Phase 2: Local Edge Server Routing...");
+                current_route_state = ROUTE_LOCAL;
+                configure_mqtt_client();
+            }
+        }
     }
 }
 
@@ -427,21 +438,44 @@ static void configure_mqtt_client(void) {
     }
 
     esp_mqtt_client_config_t mqtt_cfg = {0};
-    
-    // --- ESP-IDF v6 Network Timeout ---
     mqtt_cfg.network.timeout_ms = 30000; 
-    // ----------------------------------
 
-    mqtt_cfg.broker.address.uri = pri_broker_uri;
-    if (strncmp(pri_broker_uri, "mqtts://", strlen("mqtts://")) == 0) {
-        mqtt_cfg.broker.verification.certificate = mosqmq_root_ca;
-        mqtt_cfg.credentials.username = MQTT_USERNAME;
-        mqtt_cfg.credentials.authentication.password = MQTT_PASSWORD;
+    if (current_route_state == ROUTE_CLOUD) {
+        mqtt_cfg.broker.address.uri = pri_broker_uri;
+        if (strncmp(pri_broker_uri, "mqtts://", strlen("mqtts://")) == 0) {
+            mqtt_cfg.broker.verification.certificate = mosqmq_root_ca;
+            mqtt_cfg.credentials.username = MQTT_USERNAME;
+            mqtt_cfg.credentials.authentication.password = MQTT_PASSWORD;
+        }
+    } else if (current_route_state == ROUTE_LOCAL) {
+        mqtt_cfg.broker.address.uri = sec_broker_uri; 
+        
+        if (strncmp(sec_broker_uri, "mqtts://", strlen("mqtts://")) == 0) {
+            mqtt_cfg.broker.verification.certificate = mosqmq_root_ca;
+            mqtt_cfg.credentials.username = LOCAL_MQTT_USERNAME;
+            mqtt_cfg.credentials.authentication.password = LOCAL_MQTT_PASSWORD;
+        }
     }
 
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(mqtt_client);
+}
+
+// ==========================================
+// BACKGROUND CLOUD RECOVERY WATCHDOG
+// ==========================================
+void cloud_watchdog_task(void *pvParameter) {
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(60000)); 
+
+        if (current_hw_mode == HW_MODE_WIFI && current_route_state == ROUTE_LOCAL) {
+            ESP_LOGI(TAG, "Watchdog probing cloud link to restore primary route...");
+            current_route_state = ROUTE_CLOUD;
+            cloud_disconnect_count = 0;
+            configure_mqtt_client(); 
+        }
+    }
 }
 
 // ==========================================
@@ -453,13 +487,11 @@ static void ppp_ip_event_handler(void *arg, esp_event_base_t base, int32_t event
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Cellular PPP up. IP: " IPSTR, IP2STR(&event->ip_info.ip));
         
-        // --- FORCE GOOGLE DNS (ESP-IDF v6 Compatible) ---
         esp_netif_dns_info_t dns_info = {0};
         dns_info.ip.type = ESP_IPADDR_TYPE_V4;
         esp_netif_str_to_ip4("8.8.8.8", &dns_info.ip.u_addr.ip4);
         esp_netif_set_dns_info(ppp_netif, ESP_NETIF_DNS_MAIN, &dns_info);
         ESP_LOGI(TAG, "Forced Google DNS (8.8.8.8) to bypass carrier DNS failure.");
-        // ------------------------
 
         xEventGroupSetBits(s_network_event_group, PPP_CONNECTED_BIT);
     } else if (event_id == IP_EVENT_PPP_LOST_IP) {
@@ -596,7 +628,7 @@ void telemetry_builder_task(void *pvParameter) {
                 for (int channel = 0; channel < 4; channel++) {
                     if (port_active[i][channel]) {
                         int16_t raw_reading = global_node_data[i].port_values[channel];
-                        uint8_t current_status = evaluate_port_status(raw_reading); // Accurate status evaluation injected
+                        uint8_t current_status = evaluate_port_status(raw_reading); 
 
                         int port_data[3] = {channel, raw_reading, current_status}; 
                         cJSON_AddItemToArray(ports_array, cJSON_CreateIntArray(port_data, 3));
@@ -805,6 +837,43 @@ void backlog_replay_task(void *pvParameter) {
 }
 
 // ==========================================
+// WI-FI STATION SETUP (FOR TESTING)
+// ==========================================
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Wi-Fi disconnected. Retrying...");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Wi-Fi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        
+        if (mqtt_client == NULL) {
+            current_route_state = ROUTE_CLOUD;
+            configure_mqtt_client();
+        }
+    }
+}
+
+static void wifi_init_sta(void) {
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+
+    wifi_config_t wifi_config = {0};
+    strcpy((char *)wifi_config.sta.ssid, wifi_ssid);
+    strcpy((char *)wifi_config.sta.password, wifi_pass);
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_start();
+}
+
+// ==========================================
 // APPLICATION MAIN
 // ==========================================
 void app_main(void) {
@@ -862,10 +931,15 @@ void app_main(void) {
 
     // I2C Bus Initialization & Master Registration
     if (i2c_master_init() == ESP_OK) {
-        // Register DS3231 RTC Immediately
         i2c_device_config_t ds_cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = DS3231_ADDR, .scl_speed_hz = I2C_MASTER_FREQ_HZ };
         i2c_master_bus_add_device(bus_handle, &ds_cfg, &ds3231_handle);
         ESP_LOGI(TAG, "DS3231 RTC successfully mapped to master bus.");
+
+        // Sync OS time with RTC to prevent TLS certificate expiration errors
+        struct timeval tv = { .tv_sec = get_rtc_epoch(), .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        ESP_LOGI(TAG, "ESP32 OS Time successfully synced with DS3231 hardware.");
+        
     } else {
         ESP_LOGE(TAG, "Failed to initialize I2C master peripheral engine.");
     }
@@ -885,5 +959,7 @@ void app_main(void) {
         xTaskCreate(cellular_task, "cellular", 6144, NULL, 5, NULL);
     } else {
         ESP_LOGI(TAG, ">>> BOOTING WI-FI STATION <<<");
+        wifi_init_sta(); 
+        xTaskCreate(cloud_watchdog_task, "cloud_wdog", 2048, NULL, 3, NULL); 
     }
 }
