@@ -11,6 +11,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
+#include <netdb.h>
 #include <inttypes.h>
 #include <sys/stat.h>
 
@@ -79,6 +80,7 @@ static HardwareConfig_t current_hw_mode = HW_MODE_WIFI;
 static RoutingState_t current_route_state = ROUTE_CLOUD;
 static int cloud_disconnect_count = 0;
 volatile bool is_mqtt_connected = false;
+volatile bool trigger_failover = false; 
 
 char wifi_ssid[64];
 char wifi_pass[64];
@@ -423,9 +425,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGW(TAG, "Cloud connection attempt %d failed.", cloud_disconnect_count);
             
             if (cloud_disconnect_count >= MAX_CLOUD_FAILURES) {
-                ESP_LOGE(TAG, "Cloud unreachable. Triggering Phase 2: Local Edge Server Routing...");
-                current_route_state = ROUTE_LOCAL;
-                configure_mqtt_client();
+                ESP_LOGE(TAG, "Cloud unreachable. Flagging for safe Phase 2 Failover...");
+                trigger_failover = true; // Safely pass execution to the watchdog
             }
         }
     }
@@ -463,18 +464,53 @@ static void configure_mqtt_client(void) {
 }
 
 // ==========================================
+// LIGHTWEIGHT WAN CONNECTIVITY PROBE
+// ==========================================
+static bool is_internet_available(void) {
+    struct addrinfo hints = { .ai_family = AF_INET };
+    struct addrinfo *res;
+    
+    int err = getaddrinfo("google.com", NULL, &hints, &res);
+    if (err == 0) {
+        freeaddrinfo(res);
+        return true; 
+    }
+    return false; 
+}
+
+// ==========================================
 // BACKGROUND CLOUD RECOVERY WATCHDOG
 // ==========================================
 void cloud_watchdog_task(void *pvParameter) {
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(60000)); 
+    TickType_t last_cloud_ping = xTaskGetTickCount();
 
-        if (current_hw_mode == HW_MODE_WIFI && current_route_state == ROUTE_LOCAL) {
-            ESP_LOGI(TAG, "Watchdog probing cloud link to restore primary route...");
-            current_route_state = ROUTE_CLOUD;
-            cloud_disconnect_count = 0;
-            configure_mqtt_client(); 
+    while (1) {
+        // 1. Process failover requests safely outside the MQTT task
+        if (trigger_failover) {
+            trigger_failover = false;
+            ESP_LOGW(TAG, "Executing Phase 2: Local Edge Server Routing...");
+            current_route_state = ROUTE_LOCAL;
+            configure_mqtt_client();
         }
+
+        // 2. Silently probe the WAN every 60 seconds if stuck in local mode
+        if (current_hw_mode == HW_MODE_WIFI && current_route_state == ROUTE_LOCAL) {
+            if ((xTaskGetTickCount() - last_cloud_ping) > pdMS_TO_TICKS(60000)) {
+                last_cloud_ping = xTaskGetTickCount();
+                ESP_LOGI(TAG, "Watchdog probing WAN connectivity silently...");
+                
+                if (is_internet_available()) {
+                    ESP_LOGI(TAG, "Internet restored! Tearing down local socket and returning to Cloud...");
+                    current_route_state = ROUTE_CLOUD;
+                    cloud_disconnect_count = 0;
+                    configure_mqtt_client(); 
+                } else {
+                    ESP_LOGW(TAG, "Internet still down. Preserving Phase 2 local edge routing.");
+                }
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Tick every 1 second for fast failover response
     }
 }
 
