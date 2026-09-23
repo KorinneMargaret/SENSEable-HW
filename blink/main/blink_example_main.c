@@ -19,8 +19,6 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
-#include "lwip/sockets.h" // Ensure this is at the top of your file with the other includes
-
 
 #include "esp_system.h"
 #include "esp_mac.h"
@@ -43,6 +41,7 @@
 
 #include "credentials.h"
 #include "lwip/dns.h"  
+#include "lwip/sockets.h" // Required for the Bulletproof WAN socket probe
 
 static const char *TAG = "THESIS_NODE";
 
@@ -807,7 +806,6 @@ static bool is_internet_available(void) {
     return false; // Internet is confirmed DEAD
 }
 
-
 // ==========================================
 // BACKGROUND CLOUD RECOVERY WATCHDOG
 // ==========================================
@@ -976,6 +974,10 @@ void telemetry_builder_task(void *pvParameter) {
         cJSON_AddNumberToObject(root, "v", 1);
         cJSON_AddStringToObject(root, "tid", tenant_id);
         cJSON_AddStringToObject(root, "nid", node_id);
+        
+        // --- TAG INJECTION ---
+        cJSON_AddStringToObject(root, "net", (current_hw_mode == HW_MODE_CELLULAR) ? "cell" : "wifi");
+        
         cJSON_AddNumberToObject(root, "ts", (double)get_rtc_epoch());
 
         cJSON *adc_array = cJSON_AddArrayToObject(root, "adc");
@@ -1105,6 +1107,10 @@ void discovery_builder_task(void *pvParameter) {
         cJSON_AddNumberToObject(root, "v", 1);
         cJSON_AddStringToObject(root, "tid", tenant_id);
         cJSON_AddStringToObject(root, "nid", node_id);
+        
+        // --- TAG INJECTION ---
+        cJSON_AddStringToObject(root, "net", (current_hw_mode == HW_MODE_CELLULAR) ? "cell" : "wifi");
+        
         cJSON_AddNumberToObject(root, "ts", (double)get_rtc_epoch());
         cJSON_AddNumberToObject(root, "tlm_interval_ms", TELEMETRY_INTERVAL_MS);
 
@@ -1214,9 +1220,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Wi-Fi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         
-        // --- NEW OPTIMIZATION ---
-        // If we were degraded in Phase 2, don't wait 60s for the watchdog.
-        // Test WAN immediately upon receiving an IP.
+        // --- FAST RECOVERY PATCH ---
         if (current_route_state == ROUTE_LOCAL) {
             if (is_internet_available()) {
                 ESP_LOGI(TAG, "Fast recovery: Internet verified on new IP lease! Switching to Cloud Phase 1...");
