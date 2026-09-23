@@ -41,18 +41,23 @@
 
 #include "credentials.h"
 #include "lwip/dns.h"  
-#include "lwip/sockets.h" // Required for the Bulletproof WAN socket probe
+#include "lwip/sockets.h"
 
 static const char *TAG = "THESIS_NODE";
 
-#define TELEMETRY_INTERVAL_MS   10000
-#define DISCOVERY_HEARTBEAT_MS  60000
-#define PROVISION_SWITCH_GPIO   0
-#define SPOOL_FILE_PATH         "/fs/telemetry_spool.jsonl"
-#define MAX_CLOUD_FAILURES      3
+// ==========================================
+// TIMING & NETWORK TIMEOUT CONFIGURATIONS
+// ==========================================
+#define TELEMETRY_INTERVAL_MS     10000
+#define DISCOVERY_HEARTBEAT_MS    60000
+#define MQTT_NETWORK_TIMEOUT_MS   60000 
+#define MQTT_KEEPALIVE_SEC        120
+#define MAX_CLOUD_FAILURES        3
 
-#define FLOATING_LEAK_MIN       4500
-#define FLOATING_LEAK_MAX       5000
+#define PROVISION_SWITCH_GPIO     0
+#define SPOOL_FILE_PATH           "/fs/telemetry_spool.jsonl"
+#define FLOATING_LEAK_MIN         4500
+#define FLOATING_LEAK_MAX         5000
 
 // ==========================================
 // DYNAMIC TOPIC & ID BUFFERS
@@ -742,14 +747,18 @@ static void configure_mqtt_client(void) {
     }
 
     esp_mqtt_client_config_t mqtt_cfg = {0};
-    mqtt_cfg.network.timeout_ms = 60000; 
+    
+    // --- UPDATED MACRO USAGE ---
+    mqtt_cfg.network.timeout_ms = MQTT_NETWORK_TIMEOUT_MS; 
 
     // Last Will and Testament configuration
     mqtt_cfg.session.last_will.topic   = topic_status;
     mqtt_cfg.session.last_will.msg     = "{\"t\":\"lwt\",\"status\":\"offline\"}";
     mqtt_cfg.session.last_will.qos     = 1;
     mqtt_cfg.session.last_will.retain  = 1;
-    mqtt_cfg.session.keepalive        = 120;
+    
+    // --- UPDATED MACRO USAGE ---
+    mqtt_cfg.session.keepalive        = MQTT_KEEPALIVE_SEC;
 
     if (current_route_state == ROUTE_CLOUD) {
         mqtt_cfg.broker.address.uri = pri_broker_uri;
