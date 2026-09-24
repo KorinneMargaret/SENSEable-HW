@@ -1,4 +1,4 @@
-idf_component_register(SRCS "blink_example_main.c"
+idf_component_register(SRCS "blink_example_main.c" "captive_portal.c"
                        INCLUDE_DIRS "."
                        PRIV_REQUIRES esp_http_server
                                      esp_wifi

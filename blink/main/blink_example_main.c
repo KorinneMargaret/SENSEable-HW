@@ -14,7 +14,6 @@
 #include <netdb.h>
 #include <inttypes.h>
 #include <sys/stat.h>
-#include <ctype.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -30,7 +29,6 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "mqtt_client.h"
-#include "esp_http_server.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -40,7 +38,9 @@
 #include "esp_littlefs.h"
 #include "esp_modem_api.h"
 
-#include "credentials.h"   // <--- ADD THIS LINE BACK IN
+#include "credentials.h"   
+#include "captive_portal.h"
+
 #include "lwip/dns.h"  
 #include "lwip/sockets.h"
 
@@ -55,7 +55,7 @@ static const char *TAG = "THESIS_NODE";
 #define MQTT_KEEPALIVE_SEC        120
 #define MAX_CLOUD_FAILURES        3
 
-#define PROVISION_SWITCH_GPIO     32 // GPIO 0 is the physical 'BOOT' button on the ESP32!
+#define PROVISION_SWITCH_GPIO     32 
 #define SPOOL_FILE_PATH           "/fs/telemetry_spool.jsonl"
 #define FLOATING_LEAK_MIN         4500
 #define FLOATING_LEAK_MAX         5000
@@ -63,8 +63,8 @@ static const char *TAG = "THESIS_NODE";
 // ==========================================
 // DYNAMIC TOPIC & ID BUFFERS
 // ==========================================
-char node_id[32];
-char tenant_id[32] = "tenant123"; // Default fallback
+char node_id[32]; 
+char tenant_id[32] = "tenant123"; 
 char topic_tlm[128];
 char topic_cmd[128];
 char topic_ack[128];
@@ -75,7 +75,8 @@ char topic_status[128];
 // EXPANDED ACTUATOR PIN MAPS & MUX LAYOUT
 // ==========================================
 #define NUM_ACTUATORS       6  
-const int actuator_gpios[NUM_ACTUATORS] = {4, 25, 13, 14, 16, 17};
+// GPIO 16 & 17 Replaced with 26 & 27 to avoid UART conflict with A7670C
+const int actuator_gpios[NUM_ACTUATORS] = {4, 25, 13, 14, 26, 27};
 const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
     LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2,
     LEDC_CHANNEL_3, LEDC_CHANNEL_4, LEDC_CHANNEL_5
@@ -103,7 +104,6 @@ auto_shutoff_args_t global_timer_args[NUM_ACTUATORS];
 #define MODEM_BAUD_RATE       115200
 #define MODEM_SYNC_RETRIES    30
 #define MODEM_SIGNAL_RETRIES  60
-//#define CELLULAR_APN          "internet"
 
 // ==========================================
 // SYSTEM ENUMS & STATE STORAGE
@@ -117,10 +117,11 @@ static int cloud_disconnect_count = 0;
 volatile bool is_mqtt_connected = false;
 volatile bool trigger_failover = false;
 
-char wifi_ssid[64] = "DITO_D825D_2.4"; // Default fallback
+char wifi_ssid[64] = "DITO_D825D_2.4"; 
 char wifi_pass[64] = "password123";
+char cellular_apn[64] = "internet.globe.com.ph"; 
 char pri_broker_uri[128] = "mqtts://8f90386c155e4bdcac6e637baf348d96.s1.eu.hivemq.cloud:8883";
-char sec_broker_uri[128] = "mqtts://192.168.8.161:8883"; // Default fallback
+char sec_broker_uri[128] = "mqtts://192.168.8.161:8883"; 
 
 // ==========================================
 // I2C & HARDWARE GLOBALS
@@ -168,189 +169,6 @@ bool port_active[4][4] = {
 static void configure_mqtt_client(void);
 static esp_err_t i2c_master_init(void);
 
-// ============================================================================
-// >>> NEW: SCALABLE CAPTIVE PORTAL PROVISIONING BLOCK <<<
-// ============================================================================
-#define DNS_PORT 53
-static httpd_handle_t portal_server = NULL;
-
-void dns_server_task(void *pvParameters) {
-    uint8_t rx_buffer[128];
-    uint8_t tx_buffer[128];
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
-
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) { vTaskDelete(NULL); return; }
-
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(DNS_PORT);
-    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        close(sock); vTaskDelete(NULL); return;
-    }
-    ESP_LOGI("PROVISION", "Captive DNS Server listening on UDP port 53...");
-
-    while (1) {
-        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&client_addr, &client_addr_len);
-        if (len < 12) continue; 
-        memcpy(tx_buffer, rx_buffer, len);
-        tx_buffer[2] = 0x81; tx_buffer[3] = 0x80; tx_buffer[7] = 1;
-        int idx = len;
-        tx_buffer[idx++] = 0xC0; tx_buffer[idx++] = 0x0C;
-        tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x01; 
-        tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x01;
-        tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x00;
-        tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x3C; 
-        tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x04; 
-        tx_buffer[idx++] = 192;  tx_buffer[idx++] = 168; tx_buffer[idx++] = 4; tx_buffer[idx++] = 1;
-        sendto(sock, tx_buffer, idx, 0, (struct sockaddr *)&client_addr, client_addr_len);
-    }
-}
-
-static const char *HTML_CONFIG_PAGE =
-"<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-"<style>"
-"body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f4f6f9; color: #333; }"
-".card { background: white; border-radius: 12px; padding: 24px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); max-width: 400px; margin: auto; }"
-"h2 { margin-top: 0; color: #1a365d; font-size: 20px; }"
-"label { font-weight: 600; font-size: 13px; color: #4a5568; display: block; margin-top: 14px; margin-bottom: 4px; }"
-"input, select { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 15px; }"
-"button { width: 100%; margin-top: 20px; background: #2b6cb0; color: white; border: none; padding: 12px; border-radius: 6px; font-size: 16px; font-weight: bold; cursor: pointer; }"
-"button:hover { background: #2c5282; }"
-"</style></head><body>"
-"<div class=\"card\">"
-"<h2>SENSEable Node Setup</h2>"
-"<form action=\"/save\" method=\"POST\">"
-"<label>Operating Mode</label>"
-"<select name=\"hw_mode\">"
-"<option value=\"0\">Wi-Fi Station Mode</option>"
-"<option value=\"1\">Cellular (A7670C) Mode</option>"
-"</select>"
-"<label>Wi-Fi SSID</label>"
-"<input type=\"text\" name=\"ssid\" placeholder=\"Farm Wi-Fi Name\" required>"
-"<label>Wi-Fi Password</label>"
-"<input type=\"password\" name=\"pass\" placeholder=\"Wi-Fi Password\">"
-"<label>Edge Broker URI (Mosquitto)</label>"
-"<input type=\"text\" name=\"sec_uri\" value=\"mqtts://192.168.8.161:8883\" required>"
-"<label>Tenant ID</label>"
-"<input type=\"text\" name=\"tenant_id\" value=\"tenant123\" required>"
-"<button type=\"submit\">Save & Apply</button>"
-"</form></div></body></html>";
-
-static const char *HTML_SAVED_PAGE =
-"<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-"<style>body{font-family:sans-serif;text-align:center;padding:40px;background:#f0fff4;color:#22543d;}"
-".card{background:white;padding:30px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.08);max-width:380px;margin:auto;}</style></head><body>"
-"<div class=\"card\"><h2>Configuration Saved!</h2>"
-"<p>Credentials securely stored in flash.</p>"
-"<p><b>Next Step:</b> Flip the slide switch back to <b>Run Mode</b> and press the Reset button.</p>"
-"</div></body></html>";
-
-static void url_decode(char *dst, const char *src, size_t dst_size) {
-    char a, b; 
-    size_t d_idx = 0;
-    while (*src && d_idx < dst_size - 1) {
-        if (*src == '%' && ((a = src[1]) && (b = src[2])) && (isxdigit((int)a) && isxdigit((int)b))) {
-            
-            if (a >= 'a') { a -= 'a' - 'A'; }
-            if (a >= 'A') { a -= ('A' - 10); } else { a -= '0'; }
-            
-            if (b >= 'a') { b -= 'a' - 'A'; }
-            if (b >= 'A') { b -= ('A' - 10); } else { b -= '0'; }
-            
-            dst[d_idx++] = 16 * a + b; 
-            src += 3;
-        } else if (*src == '+') { 
-            dst[d_idx++] = ' '; 
-            src++;
-        } else { 
-            dst[d_idx++] = *src++; 
-        }
-    }
-    dst[d_idx] = '\0';
-}
-
-static esp_err_t get_root_handler(httpd_req_t *req) {
-    httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, HTML_CONFIG_PAGE, HTTPD_RESP_USE_STRLEN);
-}
-
-static esp_err_t captive_redirect_handler(httpd_req_t *req) {
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
-    return httpd_resp_send(req, NULL, 0);
-}
-
-static esp_err_t post_save_handler(httpd_req_t *req) {
-    char buf[512];
-    int ret, remaining = req->content_len;
-    if (remaining >= sizeof(buf)) { httpd_resp_send_500(req); return ESP_FAIL; }
-    ret = httpd_req_recv(req, buf, remaining);
-    if (ret <= 0) return ESP_FAIL;
-    buf[ret] = '\0';
-
-    char raw_val[128];
-    char clean_ssid[64] = {0}, clean_pass[64] = {0}, clean_sec_uri[128] = {0}, clean_tenant[32] = {0};
-    uint8_t mode_val = 0;
-
-    if (httpd_query_key_value(buf, "hw_mode", raw_val, sizeof(raw_val)) == ESP_OK) mode_val = (uint8_t)atoi(raw_val);
-    if (httpd_query_key_value(buf, "ssid", raw_val, sizeof(raw_val)) == ESP_OK) url_decode(clean_ssid, raw_val, sizeof(clean_ssid));
-    if (httpd_query_key_value(buf, "pass", raw_val, sizeof(raw_val)) == ESP_OK) url_decode(clean_pass, raw_val, sizeof(clean_pass));
-    if (httpd_query_key_value(buf, "sec_uri", raw_val, sizeof(raw_val)) == ESP_OK) url_decode(clean_sec_uri, raw_val, sizeof(clean_sec_uri));
-    if (httpd_query_key_value(buf, "tenant_id", raw_val, sizeof(raw_val)) == ESP_OK) url_decode(clean_tenant, raw_val, sizeof(clean_tenant));
-
-    nvs_handle_t h;
-    if (nvs_open("senseable", NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, "hw_mode", mode_val);
-        nvs_set_str(h, "wifi_ssid", clean_ssid);
-        nvs_set_str(h, "wifi_pass", clean_pass);
-        nvs_set_str(h, "sec_uri", clean_sec_uri);
-        nvs_set_str(h, "tenant_id", clean_tenant);
-        nvs_commit(h); nvs_close(h);
-        ESP_LOGI("PROVISION", "Credentials successfully committed to NVS.");
-    }
-    httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, HTML_SAVED_PAGE, HTTPD_RESP_USE_STRLEN);
-}
-
-void start_captive_web_server(void) {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8;
-    if (httpd_start(&portal_server, &config) == ESP_OK) {
-        httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = get_root_handler };
-        httpd_register_uri_handler(portal_server, &root_uri);
-        httpd_uri_t save_uri = { .uri = "/save", .method = HTTP_POST, .handler = post_save_handler };
-        httpd_register_uri_handler(portal_server, &save_uri);
-        httpd_uri_t apple_uri = { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_redirect_handler };
-        httpd_register_uri_handler(portal_server, &apple_uri);
-        httpd_uri_t android_uri = { .uri = "/generate_204", .method = HTTP_GET, .handler = captive_redirect_handler };
-        httpd_register_uri_handler(portal_server, &android_uri);
-    }
-}
-
-static void wifi_init_softap(void) {
-    esp_netif_create_default_wifi_ap();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    char ap_ssid[64];
-    sprintf(ap_ssid, "SENSEable-Setup-%s", node_id);
-    wifi_config_t wifi_config = {
-        .ap = {
-            .ssid_len = strlen(ap_ssid), .channel = 1, .password = "", .max_connection = 4, .authmode = WIFI_AUTH_OPEN
-        },
-    };
-    strcpy((char *)wifi_config.ap.ssid, ap_ssid);
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI("PROVISION", "SoftAP active: SSID [%s] at 192.168.4.1", ap_ssid);
-}
-// ============================================================================
-
-
 // ==========================================
 // DYNAMIC NODE ID GENERATION
 // ==========================================
@@ -370,6 +188,7 @@ static void build_mqtt_topics(void) {
     ESP_LOGI(TAG, "====================================");
     ESP_LOGI(TAG, "PROVISIONED AS: %s / %s", tenant_id, node_id);
     ESP_LOGI(TAG, "Command Topic: %s", topic_cmd);
+    ESP_LOGI(TAG, "Telemetry Topic: %s", topic_tlm);
     ESP_LOGI(TAG, "====================================");
 }
 
@@ -528,6 +347,10 @@ static void recover_i2c_bus(void) {
         gpio_set_level(I2C_MASTER_SCL_IO, 1); vTaskDelay(pdMS_TO_TICKS(5));
         gpio_set_level(I2C_MASTER_SDA_IO, 1); vTaskDelay(pdMS_TO_TICKS(5));
 
+        // ---> ADD THESE TWO LINES HERE <---
+        gpio_reset_pin(I2C_MASTER_SDA_IO);
+        gpio_reset_pin(I2C_MASTER_SCL_IO);
+
         if (i2c_master_init() == ESP_OK) {
             i2c_device_config_t ds_cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = DS3231_ADDR, .scl_speed_hz = I2C_MASTER_FREQ_HZ };
             i2c_master_bus_add_device(bus_handle, &ds_cfg, &ds3231_handle);
@@ -647,18 +470,29 @@ void ads_reader_task(void *pvParameter) {
 // ==========================================
 static void process_incoming_command(const char *json_string) {
     cJSON *root = cJSON_Parse(json_string);
-    if (!root) return;
+    if (!root) {
+        ESP_LOGE(TAG, "Failed to parse incoming command payload as valid JSON.");
+        return;
+    }
 
     cJSON *cid_item = cJSON_GetObjectItem(root, "cid");
     const char *cid_str = (cid_item && cJSON_IsString(cid_item)) ? cid_item->valuestring : NULL;
 
-    if (!cid_str) { cJSON_Delete(root); return; }
+    if (!cid_str) {
+        ESP_LOGW(TAG, "Command rejected: missing cid");
+        cJSON_Delete(root);
+        return; 
+    }
 
     cJSON *act_item = cJSON_GetObjectItem(root, "action");
     if (act_item && cJSON_IsString(act_item)) {
         const char *action = act_item->valuestring;
 
         if (strcmp(action, "bus_recovery") == 0) {
+            cJSON *bus_id_item = cJSON_GetObjectItem(root, "bus_id");
+            int target_bus = (bus_id_item && cJSON_IsNumber(bus_id_item)) ? bus_id_item->valueint : 0;
+            ESP_LOGI(TAG, "Schema payload validated for Bus %d. Executing recovery routine...", target_bus);
+
             send_command_ack(cid_str, "started", "Beginning I2C recovery cycle");
             recover_i2c_bus(); xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
             send_command_ack(cid_str, "completed", "I2C bus recovery complete");
@@ -683,6 +517,7 @@ static void process_incoming_command(const char *json_string) {
                         if (state_item && cJSON_IsNumber(state_item)) {
                             int state_val = state_item->valueint; actuator_active_state = (state_val > 0);
                             ledc_stop(ACTUATOR_LEDC_MODE, mapped_chan, state_val); gpio_set_level(mapped_gpio, state_val);
+                            ESP_LOGI(TAG, "Binary: OUT%d (GPIO %d) -> %d [Duration: %d ms]", target_idx + 1, mapped_gpio, state_val, duration_ms);
                         }
                     } 
                     else if (strcmp(mode_str, "pwm") == 0) {
@@ -692,16 +527,19 @@ static void process_incoming_command(const char *json_string) {
                         if (state_item && cJSON_IsNumber(state_item) && state_item->valueint == 0) {
                             ledc_set_duty(ACTUATOR_LEDC_MODE, mapped_chan, 0); ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
                             actuator_active_state = false;
+                            ESP_LOGI(TAG, "PWM: OUT%d -> STOP (explicit state:0)", target_idx + 1);
                         }
                         else if (duty_item && cJSON_IsNumber(duty_item)) {
                             int duty_val = duty_item->valueint; actuator_active_state = (duty_val > 0);
                             ledc_set_duty(ACTUATOR_LEDC_MODE, mapped_chan, duty_val); ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
+                            ESP_LOGI(TAG, "PWM: OUT%d (GPIO %d) -> Duty: %d/255 [Duration: %d ms]", target_idx + 1, mapped_gpio, duty_val, duration_ms);
                         }
                     }
 
                     if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
                         if (auto_shutoff_task_handles[target_idx] != NULL) {
                             vTaskDelete(auto_shutoff_task_handles[target_idx]); auto_shutoff_task_handles[target_idx] = NULL;
+                            ESP_LOGW(TAG, "Safely terminated legacy timed worker task on OUT%d to protect override context.", target_idx + 1);
                         }
                         xSemaphoreGive(task_tracking_mutex);
                     }
@@ -738,6 +576,7 @@ static void process_incoming_command(const char *json_string) {
                     if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
                         port_active[chip_idx][ch_idx] = set_active; xSemaphoreGive(data_mutex);
                     }
+                    ESP_LOGW(TAG, "Altered configuration: Chip Index [%d] Port [%d] -> %s", chip_idx, ch_idx, set_active ? "ENABLED" : "DISABLED");
                     xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
                     send_command_ack(cid_str, "completed", "Target port map dynamically adjusted");
                 } else { send_command_ack(cid_str, "failed", "Chip or port argument range out of bounds"); }
@@ -760,6 +599,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT); 
 
         esp_mqtt_client_subscribe(mqtt_client, topic_cmd, 1);
+        ESP_LOGI(TAG, "Subscribed to Command Topic: %s", topic_cmd);
+
         esp_mqtt_client_publish(mqtt_client, topic_status, "{\"t\":\"lwt\",\"status\":\"online\"}", 0, 1, 1);
     }
     else if (event_id == MQTT_EVENT_DISCONNECTED) {
@@ -768,12 +609,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
         if (current_hw_mode == HW_MODE_WIFI && current_route_state == ROUTE_CLOUD) {
             cloud_disconnect_count++;
-            if (cloud_disconnect_count >= MAX_CLOUD_FAILURES) trigger_failover = true;
+            ESP_LOGW(TAG, "Cloud connection attempt %d failed.", cloud_disconnect_count);
+            if (cloud_disconnect_count >= MAX_CLOUD_FAILURES) {
+                ESP_LOGE(TAG, "Cloud unreachable. Flagging for safe Phase 2 Failover...");
+                trigger_failover = true;
+            }
         }
     }
     else if (event_id == MQTT_EVENT_DATA) {
-        if (event->data_len >= 1024) return;
+        if (event->data_len >= 1024) {
+            ESP_LOGE(TAG, "Payload exceeds stack buffer size. Dropping packet.");
+            return;
+        }
         char json_string[1024]; memcpy(json_string, event->data, event->data_len); json_string[event->data_len] = '\0';
+        ESP_LOGI(TAG, "Command Packet Received on [%.*s]: %s", event->topic_len, event->topic, json_string);
         process_incoming_command(json_string);
     }
 }
@@ -837,17 +686,22 @@ void cloud_watchdog_task(void *pvParameter) {
 
     while (1) {
         if (trigger_failover) {
-            trigger_failover = false; current_route_state = ROUTE_LOCAL; configure_mqtt_client();
+            trigger_failover = false; 
+            ESP_LOGW(TAG, "Executing Phase 2: Local Edge Server Routing...");
+            current_route_state = ROUTE_LOCAL; configure_mqtt_client();
         }
 
         if (current_hw_mode == HW_MODE_WIFI && current_route_state == ROUTE_LOCAL) {
             if ((xTaskGetTickCount() - last_cloud_ping) > pdMS_TO_TICKS(60000)) {
                 last_cloud_ping = xTaskGetTickCount();
+                ESP_LOGI(TAG, "Watchdog probing WAN connectivity silently...");
                 
                 if (is_internet_available()) {
                     ESP_LOGI(TAG, "Internet restored! Tearing down local socket and returning to Cloud Phase 1...");
                     current_route_state = ROUTE_CLOUD; cloud_disconnect_count = 0; configure_mqtt_client(); 
-                } 
+                } else {
+                    ESP_LOGW(TAG, "Internet still down. Preserving Phase 2 local edge routing.");
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -859,11 +713,15 @@ void cloud_watchdog_task(void *pvParameter) {
 // ==========================================
 static void ppp_ip_event_handler(void *arg, esp_event_base_t base, int32_t event_id, void *event_data) {
     if (event_id == IP_EVENT_PPP_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Cellular PPP up. IP: " IPSTR, IP2STR(&event->ip_info.ip));
         esp_netif_dns_info_t dns_info = {0}; dns_info.ip.type = ESP_IPADDR_TYPE_V4;
         esp_netif_str_to_ip4("8.8.8.8", &dns_info.ip.u_addr.ip4);
         esp_netif_set_dns_info(ppp_netif, ESP_NETIF_DNS_MAIN, &dns_info);
+        ESP_LOGI(TAG, "Forced Google DNS (8.8.8.8) to bypass carrier DNS failure.");
         xEventGroupSetBits(s_network_event_group, PPP_CONNECTED_BIT);
     } else if (event_id == IP_EVENT_PPP_LOST_IP) {
+        ESP_LOGW(TAG, "Cellular PPP lost IP.");
         xEventGroupClearBits(s_network_event_group, PPP_CONNECTED_BIT);
     }
 }
@@ -872,19 +730,36 @@ static bool modem_bring_up(void) {
     esp_modem_set_mode(modem_dce, ESP_MODEM_MODE_COMMAND);
     int tries = 0;
     while (esp_modem_sync(modem_dce) != ESP_OK) {
-        if (++tries >= MODEM_SYNC_RETRIES) return false;
+        if (++tries >= MODEM_SYNC_RETRIES) {
+            ESP_LOGE(TAG, "Modem not responding on UART. Check TX/RX swap, GND, modem power.");
+            return false;
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
+    ESP_LOGI(TAG, "Modem responded to AT.");
     bool pin_ok = false;
-    if (esp_modem_read_pin(modem_dce, &pin_ok) != ESP_OK || !pin_ok) return false;
+    if (esp_modem_read_pin(modem_dce, &pin_ok) != ESP_OK || !pin_ok) {
+        ESP_LOGE(TAG, "SIM not ready (missing, locked with PIN, or bad contact).");
+        return false;
+    }
+    ESP_LOGI(TAG, "SIM ready.");
 
     int rssi = 99, ber = 99; tries = 0;
     while (1) {
         if (esp_modem_get_signal_quality(modem_dce, &rssi, &ber) == ESP_OK && rssi > 0 && rssi != 99) break;
-        if (++tries >= MODEM_SIGNAL_RETRIES) return false;
+        if (++tries >= MODEM_SIGNAL_RETRIES) {
+            ESP_LOGE(TAG, "No cellular signal (CSQ=%d). Check antenna and coverage.", rssi);
+            return false;
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    if (esp_modem_set_mode(modem_dce, ESP_MODEM_MODE_DATA) != ESP_OK) return false;
+    ESP_LOGI(TAG, "Signal OK. CSQ=%d (~%d dBm), BER=%d", rssi, -113 + 2 * rssi, ber);
+
+    if (esp_modem_set_mode(modem_dce, ESP_MODEM_MODE_DATA) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enter PPP data mode (check APN: %s).", cellular_apn);
+        return false;
+    }
+    ESP_LOGI(TAG, "PPP data mode requested. Waiting for IP...");
     return true;
 }
 
@@ -895,7 +770,8 @@ void cellular_task(void *pvParameter) {
     esp_modem_dte_config_t dte_config = ESP_MODEM_DTE_DEFAULT_CONFIG();
     dte_config.uart_config.port_num = MODEM_UART_PORT; dte_config.uart_config.tx_io_num = MODEM_UART_TX_PIN;
     dte_config.uart_config.rx_io_num = MODEM_UART_RX_PIN; dte_config.uart_config.baud_rate = MODEM_BAUD_RATE;
-    esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG(CELLULAR_APN);
+    
+    esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG(cellular_apn);
     esp_netif_config_t netif_ppp_config = ESP_NETIF_DEFAULT_PPP();
     ppp_netif = esp_netif_new(&netif_ppp_config);
 
@@ -904,12 +780,22 @@ void cellular_task(void *pvParameter) {
 #endif
 
     modem_dce = esp_modem_new_dev(ESP_MODEM_DCE_GENERIC, &dte_config, &dce_config, ppp_netif);
-    if (modem_dce == NULL) { vTaskDelete(NULL); return; }
+    if (modem_dce == NULL) { 
+        ESP_LOGE(TAG, "esp_modem_new_dev failed.");
+        vTaskDelete(NULL); 
+        return; 
+    }
 
     while (1) {
-        while (!modem_bring_up()) vTaskDelay(pdMS_TO_TICKS(15000));
+        while (!modem_bring_up()) {
+            ESP_LOGW(TAG, "Retrying modem bring-up in 15 s...");
+            vTaskDelay(pdMS_TO_TICKS(15000));
+        }
         EventBits_t bits = xEventGroupWaitBits(s_network_event_group, PPP_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(60000));
-        if (!(bits & PPP_CONNECTED_BIT)) continue;
+        if (!(bits & PPP_CONNECTED_BIT)) {
+            ESP_LOGE(TAG, "PPP did not get an IP within 60 s. Restarting modem sequence.");
+            continue;
+        }
         
         if (mqtt_client == NULL) { current_route_state = ROUTE_CLOUD; configure_mqtt_client(); }
 
@@ -918,6 +804,7 @@ void cellular_task(void *pvParameter) {
             if (xEventGroupGetBits(s_network_event_group) & PPP_CONNECTED_BIT) down_seconds = 0; else down_seconds++;
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
+        ESP_LOGW(TAG, "PPP down for 30 s. Re-initializing modem.");
     }
 }
 
@@ -962,7 +849,13 @@ void telemetry_builder_task(void *pvParameter) {
         } else if (current_hw_mode == HW_MODE_CELLULAR) {
             char *buffered_string = cJSON_PrintUnformatted(root);
             FILE *f = fopen(SPOOL_FILE_PATH, "a");
-            if (f != NULL) { fprintf(f, "%s\n", buffered_string); fclose(f); }
+            if (f != NULL) { 
+                fprintf(f, "%s\n", buffered_string); 
+                fclose(f); 
+                ESP_LOGW(TAG, "[CELLULAR DROP] Buffered to LittleFS -> %s", buffered_string);
+            } else {
+                ESP_LOGE(TAG, "Spool open failed (%s). Telemetry dropped.", SPOOL_FILE_PATH);
+            }
             free(buffered_string);
         }
         cJSON_Delete(root);
@@ -973,8 +866,6 @@ void telemetry_builder_task(void *pvParameter) {
 // ==========================================
 // DISCOVERY BUILDER TASK
 // ==========================================
-
-// --- ADD THIS HELPER FUNCTION ---
 static bool is_sensor_attached(int16_t raw_value) {
     if (raw_value == -9999) return false; 
     if (raw_value >= FLOATING_LEAK_MIN && raw_value <= FLOATING_LEAK_MAX) {
@@ -982,7 +873,6 @@ static bool is_sensor_attached(int16_t raw_value) {
     }
     return true; 
 }
-// --------------------------------
 
 void discovery_builder_task(void *pvParameter) {
     uint32_t last_detailed_topology = 0xFFFFFFFF; static TickType_t last_disco_publish = 0;
@@ -1014,7 +904,10 @@ void discovery_builder_task(void *pvParameter) {
             xSemaphoreGive(data_mutex);
         }
 
-        if (current_detailed_topology == last_detailed_topology && (xTaskGetTickCount() - last_disco_publish) <= pdMS_TO_TICKS(DISCOVERY_HEARTBEAT_MS)) continue; 
+        bool topology_changed = (current_detailed_topology != last_detailed_topology);
+        bool heartbeat_due = (xTaskGetTickCount() - last_disco_publish) > pdMS_TO_TICKS(DISCOVERY_HEARTBEAT_MS);
+
+        if (!topology_changed && !heartbeat_due) continue; 
         
         last_detailed_topology = current_detailed_topology; last_disco_publish = xTaskGetTickCount();
 
@@ -1046,7 +939,10 @@ void discovery_builder_task(void *pvParameter) {
             xSemaphoreGive(data_mutex);
         }
         char *payload_string = cJSON_PrintUnformatted(root);
-        if (mqtt_client != NULL && payload_string != NULL) esp_mqtt_client_publish(mqtt_client, topic_disco, payload_string, 0, 1, 1);
+        if (mqtt_client != NULL && payload_string != NULL) {
+            esp_mqtt_client_publish(mqtt_client, topic_disco, payload_string, 0, 1, 1);
+            ESP_LOGW(TAG, "Topology Change Caught! New Discovery Packet Dispatched: %s", payload_string);
+        }
         free(payload_string); cJSON_Delete(root);
     }
 }
@@ -1061,6 +957,7 @@ void backlog_replay_task(void *pvParameter) {
 
         struct stat st;
         if (stat(SPOOL_FILE_PATH, &st) == 0 && st.st_size > 0) {
+            ESP_LOGW(TAG, "Cellular link restored. Initiating FIFO Backlog Replay...");
             FILE *f = fopen(SPOOL_FILE_PATH, "r");
             if (f != NULL) {
                 char line[1024];
@@ -1073,13 +970,17 @@ void backlog_replay_task(void *pvParameter) {
 
                         if (is_mqtt_connected && mqtt_client != NULL) {
                             esp_mqtt_client_publish(mqtt_client, topic_tlm, replay_payload, 0, 1, 0);
+                            ESP_LOGI(TAG, "Replayed -> %s", replay_payload);
                             vTaskDelay(pdMS_TO_TICKS(150));
                         } else { free(replay_payload); cJSON_Delete(saved_json); break; }
                         free(replay_payload); cJSON_Delete(saved_json);
                     }
                 }
                 fclose(f);
-                if (is_mqtt_connected) remove(SPOOL_FILE_PATH);
+                if (is_mqtt_connected) {
+                    remove(SPOOL_FILE_PATH);
+                    ESP_LOGI(TAG, "Backlog replay complete. LittleFS spool cleared.");
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -1092,11 +993,13 @@ void backlog_replay_task(void *pvParameter) {
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) esp_wifi_connect();
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Wi-Fi disconnected. Retrying...");
         xEventGroupClearBits(s_network_event_group, MQTT_CONNECTED_BIT); esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Wi-Fi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         if (current_route_state == ROUTE_LOCAL && is_internet_available()) {
+            ESP_LOGI(TAG, "Fast recovery: Internet verified on new IP lease! Switching to Cloud Phase 1...");
             current_route_state = ROUTE_CLOUD; cloud_disconnect_count = 0; configure_mqtt_client();
         } else if (mqtt_client == NULL) {
             current_route_state = ROUTE_CLOUD; configure_mqtt_client();
@@ -1133,24 +1036,25 @@ void app_main(void) {
     init_littlefs();
     init_dynamic_identity();
 
-    // 1. Initialize TCP/IP and events (Required for both Config and Run modes)
+    // 1. Initialize TCP/IP and events
     esp_netif_init();
     esp_event_loop_create_default();
 
-    // 2. Configure the Physical Setup Switch (GPIO 0 / BOOT Button)
+    // 2. Configure the Physical Setup Switch (GPIO 32, with Pull-Up Enabled)
     gpio_config_t switch_cfg = {
         .pin_bit_mask = (1ULL << PROVISION_SWITCH_GPIO),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE
     };
     gpio_config(&switch_cfg);
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // 3. CAPTIVE PORTAL PROVISIONING MODE
-    if (gpio_get_level(PROVISION_SWITCH_GPIO) == 0) {
+    if (ENABLE_HARDCODED_TESTING == 0 && gpio_get_level(PROVISION_SWITCH_GPIO) == 0) {
         ESP_LOGW(TAG, "===============================================");
-        ESP_LOGW(TAG, " CONFIG MODE TRIGGERED (BOOT BUTTON HELD)      ");
+        ESP_LOGW(TAG, " CONFIG MODE TRIGGERED (SLIDE SWITCH GND)      ");
         ESP_LOGW(TAG, " Broadcasting SoftAP Captive Portal...         ");
         ESP_LOGW(TAG, "===============================================");
         
@@ -1158,7 +1062,6 @@ void app_main(void) {
         xTaskCreate(dns_server_task, "dns_task", 3072, NULL, 5, NULL);
         start_captive_web_server();
 
-        // Halt here forever so the sensors/modems don't turn on
         while(1) vTaskDelay(pdMS_TO_TICKS(1000)); 
     }
 
@@ -1170,6 +1073,7 @@ void app_main(void) {
         size_t len;
         len = sizeof(wifi_ssid); nvs_get_str(h, "wifi_ssid", wifi_ssid, &len);
         len = sizeof(wifi_pass); nvs_get_str(h, "wifi_pass", wifi_pass, &len);
+        len = sizeof(cellular_apn); nvs_get_str(h, "cell_apn", cellular_apn, &len);
         len = sizeof(sec_broker_uri); nvs_get_str(h, "sec_uri", sec_broker_uri, &len);
         len = sizeof(tenant_id); nvs_get_str(h, "tenant_id", tenant_id, &len);
         uint8_t mode = 0;
@@ -1190,12 +1094,17 @@ void app_main(void) {
     if (i2c_master_init() == ESP_OK) {
         i2c_device_config_t ds_cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = DS3231_ADDR, .scl_speed_hz = I2C_MASTER_FREQ_HZ };
         i2c_master_bus_add_device(bus_handle, &ds_cfg, &ds3231_handle);
+        ESP_LOGI(TAG, "DS3231 RTC successfully mapped to master bus.");
+
         struct timeval tv = { .tv_sec = get_rtc_epoch(), .tv_usec = 0 };
         settimeofday(&tv, NULL);
+        ESP_LOGI(TAG, "ESP32 OS Time successfully synced with DS3231 hardware.");
     } else {
         ESP_LOGE(TAG, "Failed to initialize I2C master peripheral engine.");
     }
 
+    // DELAY ADDED HERE: Allow massive A7670C power surge and LLC to stabilize before scanning
+    vTaskDelay(pdMS_TO_TICKS(2000));
     scan_i2c_bus();
 
     xTaskCreate(ads_reader_task, "adc_worker", 3072, NULL, 5, NULL);
