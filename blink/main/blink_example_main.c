@@ -49,11 +49,23 @@ static const char *TAG = "THESIS_NODE";
 // ==========================================
 // TIMING & NETWORK TIMEOUT CONFIGURATIONS
 // ==========================================
-#define TELEMETRY_INTERVAL_MS     10000
-#define DISCOVERY_HEARTBEAT_MS    60000
-#define MQTT_NETWORK_TIMEOUT_MS   60000 
-#define MQTT_KEEPALIVE_SEC        120
-#define MAX_CLOUD_FAILURES        3
+#define TELEMETRY_INTERVAL_MS               10000
+#define DISCOVERY_HEARTBEAT_MS              60000
+
+// --- Cloud & MQTT Timers ---
+#define MQTT_NETWORK_TIMEOUT_MS             60000 
+#define MQTT_KEEPALIVE_SEC                  120
+#define MAX_CLOUD_FAILURES                  3
+
+// --- Wi-Fi Phase 2 Watchdog Timers ---
+#define WIFI_WAN_PROBE_INTERVAL_MS          60000 // How often to check WAN when on local edge
+#define WIFI_WAN_PROBE_TIMEOUT_SEC          3     // Max wait time for the test socket
+
+// --- Cellular Modem Watchdog Timers ---
+#define CELLULAR_BRINGUP_RETRY_MS           15000 // Delay before retrying AT init if boot fails
+#define CELLULAR_NET_WAIT_TIMEOUT_MS        60000 // Max wait for IP assignment after data mode
+#define CELLULAR_PPP_DROP_TIMEOUT_SEC       30    // Grace period for formal PPP disconnects
+#define CELLULAR_MQTT_OFFLINE_TIMEOUT_SEC   180   // Max seconds MQTT can remain dead (Dirty Drop Watchdog)
 
 #define PROVISION_SWITCH_GPIO     32 
 #define SPOOL_FILE_PATH           "/fs/telemetry_spool.jsonl"
@@ -64,7 +76,6 @@ static const char *TAG = "THESIS_NODE";
 // DYNAMIC TOPIC & ID BUFFERS
 // ==========================================
 char node_id[32]; 
-char tenant_id[32] = "tenant123"; 
 char topic_tlm[128];
 char topic_cmd[128];
 char topic_ack[128];
@@ -75,7 +86,6 @@ char topic_status[128];
 // EXPANDED ACTUATOR PIN MAPS & MUX LAYOUT
 // ==========================================
 #define NUM_ACTUATORS       6  
-// GPIO 16 & 17 Replaced with 26 & 27 to avoid UART conflict with A7670C
 const int actuator_gpios[NUM_ACTUATORS] = {4, 25, 13, 14, 26, 27};
 const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
     LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2,
@@ -117,11 +127,24 @@ static int cloud_disconnect_count = 0;
 volatile bool is_mqtt_connected = false;
 volatile bool trigger_failover = false;
 
-char wifi_ssid[64] = "DITO_D825D_2.4"; 
-char wifi_pass[64] = "password123";
-char cellular_apn[64] = "internet.globe.com.ph"; 
-char pri_broker_uri[128] = "mqtts://8f90386c155e4bdcac6e637baf348d96.s1.eu.hivemq.cloud:8883";
-char sec_broker_uri[128] = "mqtts://192.168.8.161:8883"; 
+// ==========================================
+// DYNAMIC CREDENTIAL ARRAYS (Linked to Header)
+// ==========================================
+#if ENABLE_HARDCODED_TESTING
+    char wifi_ssid[64] = TEST_WIFI_SSID;
+    char wifi_pass[64] = TEST_WIFI_PASS;
+    char cellular_apn[64] = CELLULAR_APN;
+    char pri_broker_uri[128] = TEST_BROKER_URI;
+    char sec_broker_uri[128] = TEST_SEC_BROKER_URI;
+    char tenant_id[32] = TEST_TENANT_ID;
+#else
+    char wifi_ssid[64] = DEFAULT_WIFI_SSID; 
+    char wifi_pass[64] = DEFAULT_WIFI_PASS;
+    char cellular_apn[64] = CELLULAR_APN;
+    char pri_broker_uri[128] = MQTT_BROKER_URI;
+    char sec_broker_uri[128] = SEC_BROKER_URI;
+    char tenant_id[32] = DEFAULT_TENANT_ID;
+#endif
 
 // ==========================================
 // I2C & HARDWARE GLOBALS
@@ -347,7 +370,6 @@ static void recover_i2c_bus(void) {
         gpio_set_level(I2C_MASTER_SCL_IO, 1); vTaskDelay(pdMS_TO_TICKS(5));
         gpio_set_level(I2C_MASTER_SDA_IO, 1); vTaskDelay(pdMS_TO_TICKS(5));
 
-        // ---> ADD THESE TWO LINES HERE <---
         gpio_reset_pin(I2C_MASTER_SDA_IO);
         gpio_reset_pin(I2C_MASTER_SCL_IO);
 
@@ -460,6 +482,7 @@ void ads_reader_task(void *pvParameter) {
         if (structural_drop_detected) {
             ESP_LOGW(TAG, "Hardware link drop caught! Triggering inline bit-bang recovery routine...");
             recover_i2c_bus(); xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+            vTaskDelay(pdMS_TO_TICKS(5000));
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -668,7 +691,7 @@ static bool is_internet_available(void) {
     if (err == 0) {
         int sock = socket(res->ai_family, res->ai_socktype, 0);
         if (sock >= 0) {
-            struct timeval to = { .tv_sec = 3, .tv_usec = 0 };
+            struct timeval to = { .tv_sec = WIFI_WAN_PROBE_TIMEOUT_SEC, .tv_usec = 0 };
             setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to)); setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
             int conn_err = connect(sock, res->ai_addr, res->ai_addrlen);
             close(sock); freeaddrinfo(res);
@@ -692,7 +715,7 @@ void cloud_watchdog_task(void *pvParameter) {
         }
 
         if (current_hw_mode == HW_MODE_WIFI && current_route_state == ROUTE_LOCAL) {
-            if ((xTaskGetTickCount() - last_cloud_ping) > pdMS_TO_TICKS(60000)) {
+            if ((xTaskGetTickCount() - last_cloud_ping) > pdMS_TO_TICKS(WIFI_WAN_PROBE_INTERVAL_MS)) {
                 last_cloud_ping = xTaskGetTickCount();
                 ESP_LOGI(TAG, "Watchdog probing WAN connectivity silently...");
                 
@@ -768,8 +791,10 @@ void cellular_task(void *pvParameter) {
     esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_LOST_IP, ppp_ip_event_handler, NULL);
 
     esp_modem_dte_config_t dte_config = ESP_MODEM_DTE_DEFAULT_CONFIG();
-    dte_config.uart_config.port_num = MODEM_UART_PORT; dte_config.uart_config.tx_io_num = MODEM_UART_TX_PIN;
-    dte_config.uart_config.rx_io_num = MODEM_UART_RX_PIN; dte_config.uart_config.baud_rate = MODEM_BAUD_RATE;
+    dte_config.uart_config.port_num = MODEM_UART_PORT; 
+    dte_config.uart_config.tx_io_num = MODEM_UART_TX_PIN;
+    dte_config.uart_config.rx_io_num = MODEM_UART_RX_PIN; 
+    dte_config.uart_config.baud_rate = MODEM_BAUD_RATE;
     
     esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG(cellular_apn);
     esp_netif_config_t netif_ppp_config = ESP_NETIF_DEFAULT_PPP();
@@ -788,23 +813,50 @@ void cellular_task(void *pvParameter) {
 
     while (1) {
         while (!modem_bring_up()) {
-            ESP_LOGW(TAG, "Retrying modem bring-up in 15 s...");
-            vTaskDelay(pdMS_TO_TICKS(15000));
+            ESP_LOGW(TAG, "Retrying modem bring-up in %d s...", CELLULAR_BRINGUP_RETRY_MS / 1000);
+            vTaskDelay(pdMS_TO_TICKS(CELLULAR_BRINGUP_RETRY_MS));
         }
-        EventBits_t bits = xEventGroupWaitBits(s_network_event_group, PPP_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(60000));
+        
+        EventBits_t bits = xEventGroupWaitBits(s_network_event_group, PPP_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(CELLULAR_NET_WAIT_TIMEOUT_MS));
         if (!(bits & PPP_CONNECTED_BIT)) {
-            ESP_LOGE(TAG, "PPP did not get an IP within 60 s. Restarting modem sequence.");
+            ESP_LOGE(TAG, "PPP did not get an IP within %d s. Restarting modem sequence.", CELLULAR_NET_WAIT_TIMEOUT_MS / 1000);
             continue;
         }
         
         if (mqtt_client == NULL) { current_route_state = ROUTE_CLOUD; configure_mqtt_client(); }
 
         int down_seconds = 0;
-        while (down_seconds < 30) {
-            if (xEventGroupGetBits(s_network_event_group) & PPP_CONNECTED_BIT) down_seconds = 0; else down_seconds++;
+        int mqtt_offline_seconds = 0;
+
+        // The Smart Watchdog Loop
+        while (1) {
+            // Check 1: Did the PPP stack explicitly report a drop?
+            if (xEventGroupGetBits(s_network_event_group) & PPP_CONNECTED_BIT) {
+                down_seconds = 0; 
+            } else { 
+                down_seconds++; 
+            }
+
+            // Check 2: Is MQTT failing to reach the internet?
+            if (!is_mqtt_connected) {
+                mqtt_offline_seconds++;
+            } else {
+                mqtt_offline_seconds = 0;
+            }
+
+            // If PPP is formally down for threshold, OR if MQTT is totally dead for threshold (Hardware Drop)
+            if (down_seconds >= CELLULAR_PPP_DROP_TIMEOUT_SEC || mqtt_offline_seconds >= CELLULAR_MQTT_OFFLINE_TIMEOUT_SEC) {
+                ESP_LOGW(TAG, "FATAL: Cellular link dead (PPP dropped or MQTT timeout). Forcing hard modem reset.");
+                
+                // Escape PPP data mode back to AT command mode
+                esp_modem_set_mode(modem_dce, ESP_MODEM_MODE_COMMAND);
+                xEventGroupClearBits(s_network_event_group, PPP_CONNECTED_BIT);
+                
+                // Break out of the watchdog loop to trigger the modem_bring_up() sequence again
+                break; 
+            }
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
-        ESP_LOGW(TAG, "PPP down for 30 s. Re-initializing modem.");
     }
 }
 
@@ -848,6 +900,17 @@ void telemetry_builder_task(void *pvParameter) {
             free(payload_string);
         } else if (current_hw_mode == HW_MODE_CELLULAR) {
             char *buffered_string = cJSON_PrintUnformatted(root);
+            
+            // --- NEW SAFEGUARD: Check file size before writing ---
+            struct stat st;
+            if (stat(SPOOL_FILE_PATH, &st) == 0) {
+                if (st.st_size > 1000000) { // 1,000,000 bytes = ~1 MB
+                    ESP_LOGE(TAG, "LittleFS spool reached 1MB limit! Wiping backlog to prevent flash corruption.");
+                    remove(SPOOL_FILE_PATH);
+                }
+            }
+            // -----------------------------------------------------
+
             FILE *f = fopen(SPOOL_FILE_PATH, "a");
             if (f != NULL) { 
                 fprintf(f, "%s\n", buffered_string); 
