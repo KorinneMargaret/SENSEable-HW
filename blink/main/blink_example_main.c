@@ -82,19 +82,28 @@ char topic_ack[128];
 char topic_disco[128];
 char topic_status[128];
 
+
 // ==========================================
 // EXPANDED ACTUATOR PIN MAPS & MUX LAYOUT
 // ==========================================
-#define NUM_ACTUATORS       6  
-const int actuator_gpios[NUM_ACTUATORS] = {4, 25, 13, 14, 26, 27};
+#define NUM_ACTUATORS       8  
+
+// Pins 34-39 are Input Only. Pins 0, 2, 5, 12, 15 are Boot Strapping Pins.
+// GPIO 14 is bypassed due to its 1MHz JTAG clock output during boot.
+// Safely utilizing GPIO 19 as the replacement.
+const int actuator_gpios[NUM_ACTUATORS] = {4, 25, 13, 19, 26, 27, 33, 18};
+
+// ESP32 LEDC supports exactly 8 channels (0-7) per speed mode.
 const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
-    LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2,
-    LEDC_CHANNEL_3, LEDC_CHANNEL_4, LEDC_CHANNEL_5
+    LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2, LEDC_CHANNEL_3, 
+    LEDC_CHANNEL_4, LEDC_CHANNEL_5, LEDC_CHANNEL_6, LEDC_CHANNEL_7
 };
 #define ACTUATOR_LEDC_MODE          LEDC_LOW_SPEED_MODE
 #define ACTUATOR_LEDC_TIMER         LEDC_TIMER_0
 #define ACTUATOR_LEDC_RES           LEDC_TIMER_8_BIT   
-#define ACTUATOR_LEDC_FREQ          5000               
+#define ACTUATOR_LEDC_FREQ          10
+
+
 
 typedef struct {
     int target_idx;
@@ -306,7 +315,7 @@ static void init_actuators(void) {
         };
         ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
     }
-    ESP_LOGI(TAG, "Hardware driver arrays linked and operational (OUT1-OUT6).");
+    ESP_LOGI(TAG, "Hardware driver arrays linked and operational (OUT1-OUT8).");
 }
 
 void auto_shutoff_task(void *pvParameter) {
