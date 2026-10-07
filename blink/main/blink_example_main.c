@@ -47,6 +47,12 @@
 static const char *TAG = "THESIS_NODE";
 
 // ==========================================
+// SYSTEM LED INDICATORS
+// ==========================================
+#define SYSTEM_LED_NET            14
+#define SYSTEM_LED_FAULT          23
+
+// ==========================================
 // TIMING & NETWORK TIMEOUT CONFIGURATIONS
 // ==========================================
 #define TELEMETRY_INTERVAL_MS               10000
@@ -105,8 +111,6 @@ const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
 #define ACTUATOR_LEDC_TIMER         LEDC_TIMER_0
 #define ACTUATOR_LEDC_RES           LEDC_TIMER_8_BIT   
 #define ACTUATOR_LEDC_FREQ          10
-
-
 
 typedef struct {
     int target_idx;
@@ -203,6 +207,36 @@ bool port_active[4][4] = {
 
 static void configure_mqtt_client(void);
 static esp_err_t i2c_master_init(void);
+
+// ==========================================
+// STATUS LED INITIALIZATION & TASKS
+// ==========================================
+static void init_system_leds(void) {
+    gpio_config_t led_cfg = {
+        .pin_bit_mask = (1ULL << SYSTEM_LED_NET) | (1ULL << SYSTEM_LED_FAULT),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&led_cfg);
+    gpio_set_level(SYSTEM_LED_NET, 0);
+    gpio_set_level(SYSTEM_LED_FAULT, 0);
+}
+
+void network_led_task(void *pvParameter) {
+    bool led_state = false;
+    while (1) {
+        if (is_mqtt_connected) {
+            gpio_set_level(SYSTEM_LED_NET, 1);
+            vTaskDelay(pdMS_TO_TICKS(1000)); 
+        } else {
+            led_state = !led_state;
+            gpio_set_level(SYSTEM_LED_NET, led_state ? 1 : 0);
+            vTaskDelay(pdMS_TO_TICKS(250)); 
+        }
+    }
+}
 
 // ==========================================
 // DYNAMIC NODE ID GENERATION
@@ -420,6 +454,10 @@ static void scan_i2c_bus(void) {
                 }
             }
             num_ads_found = found_this_run;
+            
+            // Trigger Fault LED dynamically based on sensor availability
+            gpio_set_level(SYSTEM_LED_FAULT, (num_ads_found == 0) ? 1 : 0);
+
             xSemaphoreGive(data_mutex);
         }
         xSemaphoreGive(i2c_mutex);
@@ -1186,6 +1224,7 @@ void app_main(void) {
     
     init_littlefs();
     init_dynamic_identity();
+    init_system_leds(); 
 
     // 1. Initialize TCP/IP and events
     esp_netif_init();
@@ -1257,6 +1296,9 @@ void app_main(void) {
     // DELAY ADDED HERE: Allow massive A7670C power surge and LLC to stabilize before scanning
     vTaskDelay(pdMS_TO_TICKS(2000));
     scan_i2c_bus();
+
+    // Spawning the new dedicated non-blocking LED indicator task
+    xTaskCreate(network_led_task, "led_worker", 2048, NULL, 2, NULL);
 
     xTaskCreate(ads_reader_task, "adc_worker", 3072, NULL, 5, NULL);
     xTaskCreate(telemetry_builder_task, "tlm_json", 4096, NULL, 5, NULL);
