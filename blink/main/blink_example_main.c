@@ -90,6 +90,7 @@ char topic_cmd[128];
 char topic_ack[128];
 char topic_disco[128];
 char topic_status[128];
+char topic_config[128];
 
 
 // ==========================================
@@ -253,6 +254,7 @@ static void build_mqtt_topics(void) {
     sprintf(topic_ack,    "%s/%s/%s/ack",    MQTT_TOPIC_ROOT, tenant_id, node_id);
     sprintf(topic_disco,  "%s/%s/%s/disco",  MQTT_TOPIC_ROOT, tenant_id, node_id);
     sprintf(topic_status, "%s/%s/%s/status", MQTT_TOPIC_ROOT, tenant_id, node_id);
+    sprintf(topic_config, "%s/%s/%s/config", MQTT_TOPIC_ROOT, tenant_id, node_id);
 
     ESP_LOGI(TAG, "====================================");
     ESP_LOGI(TAG, "PROVISIONED AS: %s / %s", tenant_id, node_id);
@@ -730,6 +732,48 @@ static void process_incoming_command(const char *json_string, size_t length) {
 }
 
 // ==========================================
+// CONFIGURATION BROADCASTER
+// ==========================================
+static void publish_node_config(void) {
+    if (!is_mqtt_connected || mqtt_client == NULL) return;
+
+    nvs_handle_t h;
+    uint8_t mode = 0;
+    char saved_ssid[64] = "unconfigured";
+    char saved_apn[64] = "unconfigured";
+    char saved_uri[128] = "unconfigured";
+
+    if (nvs_open("senseable", NVS_READONLY, &h) == ESP_OK) {
+        size_t len;
+        nvs_get_u8(h, "hw_mode", &mode);
+        len = sizeof(saved_ssid); nvs_get_str(h, "wifi_ssid", saved_ssid, &len);
+        len = sizeof(saved_apn); nvs_get_str(h, "cell_apn", saved_apn, &len);
+        len = sizeof(saved_uri); nvs_get_str(h, "sec_uri", saved_uri, &len);
+        nvs_close(h);
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "t", "config");
+    cJSON_AddNumberToObject(root, "v", 1);
+    cJSON_AddStringToObject(root, "tid", tenant_id);
+    cJSON_AddStringToObject(root, "nid", node_id);
+    cJSON_AddStringToObject(root, "active_hw_mode", mode == 0 ? "WIFI" : "CELLULAR");
+    cJSON_AddStringToObject(root, "wifi_ssid", saved_ssid);
+    cJSON_AddStringToObject(root, "cell_apn", saved_apn);
+    cJSON_AddStringToObject(root, "target_broker", saved_uri);
+    cJSON_AddNumberToObject(root, "ts", (double)get_rtc_epoch());
+
+    char *payload = cJSON_PrintUnformatted(root);
+    if (payload != NULL) {
+        // Publish config using Retain = 1 flag
+        esp_mqtt_client_publish(mqtt_client, topic_config, payload, 0, 1, 1);
+        ESP_LOGI(TAG, "Hardware Configuration Synced to Cloud -> %s", payload);
+        free(payload);
+    }
+    cJSON_Delete(root);
+}
+
+// ==========================================
 // MQTT & TOPOLOGY-AWARE FAILOVER LOGIC
 // ==========================================
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
@@ -745,6 +789,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "Subscribed to Command Topic: %s", topic_cmd);
 
         esp_mqtt_client_publish(mqtt_client, topic_status, "{\"t\":\"lwt\",\"status\":\"online\"}", 0, 1, 1);
+        
+        // Broadcast the current configuration to the web app
+        publish_node_config();
     }
     else if (event_id == MQTT_EVENT_DISCONNECTED) {
         ESP_LOGW(TAG, "MQTT Disconnected.");

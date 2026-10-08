@@ -26,7 +26,7 @@ static const char *HTML_CONFIG_PAGE =
 "input { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 15px; }"
 "button { width: 100%; margin-top: 22px; background: #2b6cb0; color: white; border: none; padding: 12px; border-radius: 6px; font-size: 16px; font-weight: bold; cursor: pointer; }"
 
-"/* CSS-ONLY SEGMENTED TOGGLE (ZERO JS REQUIRED) */"
+"/* CSS-ONLY SEGMENTED TOGGLE */"
 ".toggle-wrap { display: flex; background: #edf2f7; border-radius: 8px; padding: 4px; margin-top: 8px; }"
 ".toggle-wrap label { flex: 1; text-align: center; padding: 8px 4px; margin: 0; cursor: pointer; border-radius: 6px; font-size: 13px; color: #4a5568; transition: all 0.2s; }"
 "input[type=\"radio\"] { display: none; }"
@@ -44,8 +44,9 @@ static const char *HTML_CONFIG_PAGE =
 "<h2>SENSEable Node Setup</h2>"
 "<form action=\"/save\" method=\"POST\">"
 
-"<input type=\"radio\" id=\"tab-wifi\" name=\"hw_mode\" value=\"0\" checked>"
-"<input type=\"radio\" id=\"tab-cell\" name=\"hw_mode\" value=\"1\">"
+"<!-- DYNAMIC RADIO BUTTONS -->"
+"<input type=\"radio\" id=\"tab-wifi\" name=\"hw_mode\" value=\"0\" %s>"
+"<input type=\"radio\" id=\"tab-cell\" name=\"hw_mode\" value=\"1\" %s>"
 
 "<label>Operating Mode</label>"
 "<div class=\"toggle-wrap\">"
@@ -55,20 +56,20 @@ static const char *HTML_CONFIG_PAGE =
 
 "<div id=\"wifi-fields\">"
 "<label>Wi-Fi SSID</label>"
-"<input type=\"text\" name=\"ssid\" placeholder=\"Wi-Fi Name\">"
-"<label>Wi-Fi Password</label>"
-"<input type=\"password\" name=\"pass\" placeholder=\"Wi-Fi Password\">"
+"<input type=\"text\" name=\"ssid\" placeholder=\"Wi-Fi Name\" value=\"%s\">"
+"<label>Wi-Fi Password <span style=\"font-weight:normal;color:#718096;\">(Leave blank to keep current)</span></label>"
+"<input type=\"password\" name=\"pass\" placeholder=\"New Wi-Fi Password\">"
 "</div>"
 
 "<div id=\"cell-fields\">"
 "<label>Cellular APN</label>"
-"<input type=\"text\" name=\"apn\" value=\"internet.globe.com.ph\" placeholder=\"e.g. internet.globe.com.ph\">"
+"<input type=\"text\" name=\"apn\" placeholder=\"e.g. internet.globe.com.ph\" value=\"%s\">"
 "</div>"
 
 "<label>Edge Broker URI (Mosquitto)</label>"
-"<input type=\"text\" name=\"sec_uri\" value=\"mqtts://192.168.8.161:8883\" required>"
+"<input type=\"text\" name=\"sec_uri\" placeholder=\"mqtts://...\" value=\"%s\" required>"
 "<label>Tenant ID</label>"
-"<input type=\"text\" name=\"tenant_id\" placeholder=\"Enter Tenant ID\" required>"
+"<input type=\"text\" name=\"tenant_id\" placeholder=\"Enter Tenant ID\" value=\"%s\" required>"
 
 "<button type=\"submit\">Save & Apply</button>"
 "</form></div></body></html>";
@@ -138,8 +139,47 @@ static void url_decode(char *dst, const char *src, size_t dst_size) {
 }
 
 static esp_err_t get_root_handler(httpd_req_t *req) {
+    nvs_handle_t h;
+    uint8_t mode = 0;
+    char saved_ssid[64] = "";
+    char saved_apn[64] = "internet.globe.com.ph"; // Fallback placeholder
+    char saved_uri[128] = "";
+    char saved_tenant[32] = "";
+
+    // Fetch existing configurations
+    if (nvs_open("senseable", NVS_READONLY, &h) == ESP_OK) {
+        size_t len;
+        nvs_get_u8(h, "hw_mode", &mode);
+        
+        len = sizeof(saved_ssid); nvs_get_str(h, "wifi_ssid", saved_ssid, &len);
+        len = sizeof(saved_apn); nvs_get_str(h, "cell_apn", saved_apn, &len);
+        len = sizeof(saved_uri); nvs_get_str(h, "sec_uri", saved_uri, &len);
+        len = sizeof(saved_tenant); nvs_get_str(h, "tenant_id", saved_tenant, &len);
+        
+        nvs_close(h);
+    }
+
+    // Allocate 4KB string buffer on the heap for the dynamic HTML
+    char *resp_str = malloc(4096);
+    if (!resp_str) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // Inject data into HTML variables
+    snprintf(resp_str, 4096, HTML_CONFIG_PAGE,
+             mode == 0 ? "checked" : "",   
+             mode == 1 ? "checked" : "",   
+             saved_ssid,
+             saved_apn,
+             saved_uri,
+             saved_tenant);
+
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, HTML_CONFIG_PAGE, HTTPD_RESP_USE_STRLEN);
+    esp_err_t res = httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+    
+    free(resp_str);
+    return res;
 }
 
 static esp_err_t captive_redirect_handler(httpd_req_t *req) {
@@ -157,8 +197,7 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
     buf[ret] = '\0';
 
     char raw_val[128];
-    char clean_ssid[64] = {0}, clean_pass[64] = {0}, clean_sec_uri[128] = {0}, clean_tenant[32] = {0};
-    char clean_apn[64] = "internet.globe.com.ph";
+    char clean_ssid[64] = {0}, clean_pass[64] = {0}, clean_sec_uri[128] = {0}, clean_tenant[32] = {0}, clean_apn[64] = {0};
     uint8_t mode_val = 0;
 
     if (httpd_query_key_value(buf, "hw_mode", raw_val, sizeof(raw_val)) == ESP_OK) mode_val = (uint8_t)atoi(raw_val);
@@ -172,7 +211,7 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
     if (nvs_open("senseable", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, "hw_mode", mode_val);
         
-        // Safety Checks: Only overwrite NVS if the user actually typed something!
+        // Strict Guardrails: Only overwrite NVS if data was actively typed
         if (strlen(clean_ssid) > 0) nvs_set_str(h, "wifi_ssid", clean_ssid);
         if (strlen(clean_pass) > 0) nvs_set_str(h, "wifi_pass", clean_pass);
         if (strlen(clean_apn) > 0) nvs_set_str(h, "cell_apn", clean_apn);
@@ -180,7 +219,7 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
         if (strlen(clean_tenant) > 0) nvs_set_str(h, "tenant_id", clean_tenant);
         
         nvs_commit(h); nvs_close(h);
-        ESP_LOGI("PROVISION", "Credentials (including APN) committed to NVS.");
+        ESP_LOGI("PROVISION", "Credentials safely committed to NVS.");
     }
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, HTML_SAVED_PAGE, HTTPD_RESP_USE_STRLEN);
@@ -206,8 +245,11 @@ void wifi_init_softap(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+    // Uses the global node_id generated in app_main for a unique network name
+    extern char node_id[32]; 
     char ap_ssid[64];
     sprintf(ap_ssid, "SENSEable-Setup-%s", node_id);
+    
     wifi_config_t wifi_config = {
         .ap = {
             .ssid_len = strlen(ap_ssid), .channel = 1, .password = "", .max_connection = 4, .authmode = WIFI_AUTH_OPEN
