@@ -68,7 +68,7 @@ static const char *HTML_CONFIG_PAGE =
 "<label>Edge Broker URI (Mosquitto)</label>"
 "<input type=\"text\" name=\"sec_uri\" value=\"mqtts://192.168.8.161:8883\" required>"
 "<label>Tenant ID</label>"
-"<input type=\"text\" name=\"tenant_id\" value=\"tenant123\" required>"
+"<input type=\"text\" name=\"tenant_id\" placeholder=\"Enter Tenant ID\" required>"
 
 "<button type=\"submit\">Save & Apply</button>"
 "</form></div></body></html>";
@@ -171,11 +171,14 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
     nvs_handle_t h;
     if (nvs_open("senseable", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, "hw_mode", mode_val);
+        
+        // Safety Checks: Only overwrite NVS if the user actually typed something!
         if (strlen(clean_ssid) > 0) nvs_set_str(h, "wifi_ssid", clean_ssid);
         if (strlen(clean_pass) > 0) nvs_set_str(h, "wifi_pass", clean_pass);
         if (strlen(clean_apn) > 0) nvs_set_str(h, "cell_apn", clean_apn);
-        nvs_set_str(h, "sec_uri", clean_sec_uri);
-        nvs_set_str(h, "tenant_id", clean_tenant);
+        if (strlen(clean_sec_uri) > 0) nvs_set_str(h, "sec_uri", clean_sec_uri);
+        if (strlen(clean_tenant) > 0) nvs_set_str(h, "tenant_id", clean_tenant);
+        
         nvs_commit(h); nvs_close(h);
         ESP_LOGI("PROVISION", "Credentials (including APN) committed to NVS.");
     }
