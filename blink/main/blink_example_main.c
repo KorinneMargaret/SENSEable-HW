@@ -138,23 +138,14 @@ volatile bool is_mqtt_connected = false;
 volatile bool trigger_failover = false;
 
 // ==========================================
-// DYNAMIC CREDENTIAL ARRAYS (Linked to Header)
+// DYNAMIC CREDENTIAL ARRAYS
 // ==========================================
-#if ENABLE_HARDCODED_TESTING
-    char wifi_ssid[64] = TEST_WIFI_SSID;
-    char wifi_pass[64] = TEST_WIFI_PASS;
-    char cellular_apn[64] = CELLULAR_APN;
-    char pri_broker_uri[128] = TEST_BROKER_URI;
-    char sec_broker_uri[128] = TEST_SEC_BROKER_URI;
-    char tenant_id[32] = TEST_TENANT_ID;
-#else
-    char wifi_ssid[64] = DEFAULT_WIFI_SSID; 
-    char wifi_pass[64] = DEFAULT_WIFI_PASS;
-    char cellular_apn[64] = CELLULAR_APN;
-    char pri_broker_uri[128] = MQTT_BROKER_URI;
-    char sec_broker_uri[128] = SEC_BROKER_URI;
-    char tenant_id[32] = DEFAULT_TENANT_ID;
-#endif
+char wifi_ssid[64] = DEFAULT_WIFI_SSID; 
+char wifi_pass[64] = DEFAULT_WIFI_PASS;
+char cellular_apn[64] = CELLULAR_APN;
+char pri_broker_uri[128] = MQTT_BROKER_URI;
+char sec_broker_uri[128] = SEC_BROKER_URI;
+char tenant_id[32] = DEFAULT_TENANT_ID;
 
 // ==========================================
 // I2C & HARDWARE GLOBALS
@@ -910,10 +901,12 @@ static void ppp_ip_event_handler(void *arg, esp_event_base_t base, int32_t event
     if (event_id == IP_EVENT_PPP_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Cellular PPP up. IP: " IPSTR, IP2STR(&event->ip_info.ip));
+       
         esp_netif_dns_info_t dns_info = {0}; dns_info.ip.type = ESP_IPADDR_TYPE_V4;
         esp_netif_str_to_ip4("8.8.8.8", &dns_info.ip.u_addr.ip4);
         esp_netif_set_dns_info(ppp_netif, ESP_NETIF_DNS_MAIN, &dns_info);
         ESP_LOGI(TAG, "Forced Google DNS (8.8.8.8) to bypass carrier DNS failure.");
+       
         xEventGroupSetBits(s_network_event_group, PPP_CONNECTED_BIT);
     } else if (event_id == IP_EVENT_PPP_LOST_IP) {
         ESP_LOGW(TAG, "Cellular PPP lost IP.");
@@ -971,10 +964,6 @@ void cellular_task(void *pvParameter) {
     esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG(cellular_apn);
     esp_netif_config_t netif_ppp_config = ESP_NETIF_DEFAULT_PPP();
     ppp_netif = esp_netif_new(&netif_ppp_config);
-
-#ifdef CONFIG_LWIP_PPP_PAP_SUPPORT
-    if (strlen(CELLULAR_USER) > 0) esp_netif_ppp_set_auth(ppp_netif, NETIF_PPP_AUTHTYPE_PAP, CELLULAR_USER, CELLULAR_PASS);
-#endif
 
     modem_dce = esp_modem_new_dev(ESP_MODEM_DCE_GENERIC, &dte_config, &dce_config, ppp_netif);
     if (modem_dce == NULL) { 
@@ -1288,7 +1277,7 @@ void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // 3. CAPTIVE PORTAL PROVISIONING MODE
-    if (ENABLE_HARDCODED_TESTING == 0 && gpio_get_level(PROVISION_SWITCH_GPIO) == 0) {
+    if (gpio_get_level(PROVISION_SWITCH_GPIO) == 0) {
         ESP_LOGW(TAG, "===============================================");
         ESP_LOGW(TAG, " CONFIG MODE TRIGGERED (SLIDE SWITCH GND)      ");
         ESP_LOGW(TAG, " Broadcasting SoftAP Captive Portal...         ");
@@ -1316,6 +1305,23 @@ void app_main(void) {
         if (nvs_get_u8(h, "hw_mode", &mode) == ESP_OK) current_hw_mode = (HardwareConfig_t)mode;
         nvs_close(h);
     }
+
+    // ==============================================================
+    // 🛑 NEW SAFETY KILL-SWITCH (UNPROVISIONED NODE PROTECTION)
+    // ==============================================================
+    if (strlen(tenant_id) == 0) {
+        ESP_LOGE(TAG, "FATAL: Board is unprovisioned (Missing Tenant ID).");
+        ESP_LOGE(TAG, "Halting execution. Please slide switch to GND and use Captive Portal.");
+        
+        // Rapidly blink the Fault LED to alert the human operator
+        while (1) {
+            gpio_set_level(SYSTEM_LED_FAULT, 1);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            gpio_set_level(SYSTEM_LED_FAULT, 0);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    // ==============================================================
     
     build_mqtt_topics();
 
