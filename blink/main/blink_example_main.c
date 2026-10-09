@@ -901,12 +901,10 @@ static void ppp_ip_event_handler(void *arg, esp_event_base_t base, int32_t event
     if (event_id == IP_EVENT_PPP_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Cellular PPP up. IP: " IPSTR, IP2STR(&event->ip_info.ip));
-       
         esp_netif_dns_info_t dns_info = {0}; dns_info.ip.type = ESP_IPADDR_TYPE_V4;
         esp_netif_str_to_ip4("8.8.8.8", &dns_info.ip.u_addr.ip4);
         esp_netif_set_dns_info(ppp_netif, ESP_NETIF_DNS_MAIN, &dns_info);
         ESP_LOGI(TAG, "Forced Google DNS (8.8.8.8) to bypass carrier DNS failure.");
-       
         xEventGroupSetBits(s_network_event_group, PPP_CONNECTED_BIT);
     } else if (event_id == IP_EVENT_PPP_LOST_IP) {
         ESP_LOGW(TAG, "Cellular PPP lost IP.");
@@ -964,6 +962,10 @@ void cellular_task(void *pvParameter) {
     esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG(cellular_apn);
     esp_netif_config_t netif_ppp_config = ESP_NETIF_DEFAULT_PPP();
     ppp_netif = esp_netif_new(&netif_ppp_config);
+
+#ifdef CONFIG_LWIP_PPP_PAP_SUPPORT
+    if (strlen(CELLULAR_USER) > 0) esp_netif_ppp_set_auth(ppp_netif, NETIF_PPP_AUTHTYPE_PAP, CELLULAR_USER, CELLULAR_PASS);
+#endif
 
     modem_dce = esp_modem_new_dev(ESP_MODEM_DCE_GENERIC, &dte_config, &dce_config, ppp_netif);
     if (modem_dce == NULL) { 
