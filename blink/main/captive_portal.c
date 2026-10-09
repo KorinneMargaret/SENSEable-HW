@@ -16,6 +16,8 @@
 #define DNS_PORT 53
 static httpd_handle_t portal_server = NULL;
 
+extern char node_id[32]; // Access the globally generated Node ID
+
 static const char *HTML_CONFIG_PAGE =
 "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
 "<style>"
@@ -69,7 +71,7 @@ static const char *HTML_CONFIG_PAGE =
 "<label>Edge Broker URI (Mosquitto)</label>"
 "<input type=\"text\" name=\"sec_uri\" placeholder=\"mqtts://...\" value=\"%s\" required>"
 "<label>Tenant ID</label>"
-"<input type=\"text\" name=\"tenant_id\" placeholder=\"Enter Tenant ID\" value=\"%s\" required>"
+"<input type=\"text\" name=\"tenant_id\" pattern=\"^[a-z0-9]{2,12}-[a-f0-9]{4}$\" title=\"Must be in format e.g. llda-add4\" placeholder=\"e.g. llda-add4\" value=\"%s\" required>"
 
 "<button type=\"submit\">Save & Apply</button>"
 "</form></div></body></html>";
@@ -79,6 +81,9 @@ static const char *HTML_SAVED_PAGE =
 "<style>body{font-family:sans-serif;text-align:center;padding:40px;background:#f0fff4;color:#22543d;}"
 ".card{background:white;padding:30px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.08);max-width:380px;margin:auto;}</style></head><body>"
 "<div class=\"card\"><h2>Configuration Saved!</h2>"
+"<div style=\"background:#e2e8f0;padding:12px;border-radius:6px;margin:15px 0;text-align:left;font-family:monospace;color:#2d3748;font-size:14px;\">"
+"<b>Node ID:</b> %s<br><b>Tenant ID:</b> %s"
+"</div>"
 "<p>Credentials securely stored in flash.</p>"
 "<p><b>Next Step:</b> Flip the slide switch back to <b>Run Mode</b> and press the Reset button.</p>"
 "</div></body></html>";
@@ -207,22 +212,63 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
     if (httpd_query_key_value(buf, "sec_uri", raw_val, sizeof(raw_val)) == ESP_OK) url_decode(clean_sec_uri, raw_val, sizeof(clean_sec_uri));
     if (httpd_query_key_value(buf, "tenant_id", raw_val, sizeof(raw_val)) == ESP_OK) url_decode(clean_tenant, raw_val, sizeof(clean_tenant));
 
+    // --- C-Level Sanitization for Tenant ID ---
+    if (strlen(clean_tenant) > 0) {
+        // Trim leading spaces
+        char *p = clean_tenant;
+        while(isspace((unsigned char)*p)) p++;
+        memmove(clean_tenant, p, strlen(p) + 1);
+        
+        // Trim trailing spaces
+        char *end = clean_tenant + strlen(clean_tenant) - 1;
+        while(end >= clean_tenant && isspace((unsigned char)*end)) {
+            *end = '\0';
+            end--;
+        }
+
+        // Lowercase string and reject forbidden chars natively as a fail-safe
+        bool valid_tid = true;
+        for(int i = 0; clean_tenant[i]; i++){
+            clean_tenant[i] = tolower((unsigned char)clean_tenant[i]);
+            if(clean_tenant[i] == '/' || clean_tenant[i] == '+' || clean_tenant[i] == '#' || clean_tenant[i] == ' ') {
+                valid_tid = false;
+            }
+        }
+        if (!valid_tid) clean_tenant[0] = '\0'; // Nuke string if illegal chars bypass HTML
+    }
+
     nvs_handle_t h;
+    char final_tenant[32] = "UNREGISTERED";
+
     if (nvs_open("senseable", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, "hw_mode", mode_val);
         
-        // Strict Guardrails: Only overwrite NVS if data was actively typed
         if (strlen(clean_ssid) > 0) nvs_set_str(h, "wifi_ssid", clean_ssid);
         if (strlen(clean_pass) > 0) nvs_set_str(h, "wifi_pass", clean_pass);
         if (strlen(clean_apn) > 0) nvs_set_str(h, "cell_apn", clean_apn);
         if (strlen(clean_sec_uri) > 0) nvs_set_str(h, "sec_uri", clean_sec_uri);
         if (strlen(clean_tenant) > 0) nvs_set_str(h, "tenant_id", clean_tenant);
         
-        nvs_commit(h); nvs_close(h);
+        nvs_commit(h); 
+        
+        // Read back the definitive tenant ID to display to the user
+        size_t len = sizeof(final_tenant);
+        nvs_get_str(h, "tenant_id", final_tenant, &len);
+        nvs_close(h);
         ESP_LOGI("PROVISION", "Credentials safely committed to NVS.");
     }
+
+    // Allocate buffer for success page injection
+    char *resp_str = malloc(2048);
+    if (!resp_str) { httpd_resp_send_500(req); return ESP_FAIL; }
+    
+    snprintf(resp_str, 2048, HTML_SAVED_PAGE, node_id, final_tenant);
+
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, HTML_SAVED_PAGE, HTTPD_RESP_USE_STRLEN);
+    esp_err_t res = httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+    
+    free(resp_str);
+    return res;
 }
 
 void start_captive_web_server(void) {
@@ -245,8 +291,6 @@ void wifi_init_softap(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    // Uses the global node_id generated in app_main for a unique network name
-    extern char node_id[32]; 
     char ap_ssid[64];
     sprintf(ap_ssid, "SENSEable-Setup-%s", node_id);
     
