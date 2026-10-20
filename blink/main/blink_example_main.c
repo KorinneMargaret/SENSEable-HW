@@ -57,6 +57,8 @@ static const char *TAG = "THESIS_NODE";
 // ==========================================
 #define TELEMETRY_INTERVAL_MS               10000
 #define DISCOVERY_HEARTBEAT_MS              60000
+#define I2C_FAST_SCAN_INTERVAL_MS           3000  // Fast 3s local hardware scan for hot-plugging
+#define I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS  10000 // Max 1 recovery per 10s when 0 chips are connected
 
 // --- Cloud & MQTT Timers ---
 #define MQTT_NETWORK_TIMEOUT_MS             60000 
@@ -152,6 +154,7 @@ char tenant_id[32] = DEFAULT_TENANT_ID;
 // ==========================================
 #define I2C_MASTER_SDA_IO  21
 #define I2C_MASTER_SCL_IO  22
+#define TCA4307_EN_GPIO    15   // <--- INSERT THIS LINE
 #define I2C_MASTER_FREQ_HZ 100000
 #define DS3231_ADDR        0x68
 #define REG_POINTER_CONVERT 0x00
@@ -163,6 +166,7 @@ i2c_master_dev_handle_t ads_handles[4] = {NULL, NULL, NULL, NULL};
 const uint8_t possible_addresses[4] = {0x48, 0x49, 0x4A, 0x4B};
 
 uint8_t num_ads_found = 0;
+static TickType_t last_zero_chip_recovery_tick = 0;
 
 esp_mqtt_client_handle_t mqtt_client = NULL;
 static esp_modem_dce_t *modem_dce = NULL;
@@ -207,6 +211,7 @@ static void init_system_leds(void) {
     gpio_config(&led_cfg);
     gpio_set_level(SYSTEM_LED_NET, 0);
     gpio_set_level(SYSTEM_LED_FAULT, 0);
+    gpio_set_level(TCA4307_EN_GPIO, 1); // <--- INSERT THIS: Keep TCA4307 gate ON by default
 }
 
 void network_led_task(void *pvParameter) {
@@ -372,18 +377,27 @@ static void init_littlefs(void) {
 }
 
 // ==========================================
-// BIT-BANG I2C BUS RECOVERY ROUTINE
+// BIT-BANG & HARDWARE GATE I2C BUS RECOVERY ROUTINE
 // ==========================================
 static void recover_i2c_bus(void) {
-    ESP_LOGW(TAG, "Executing structured software bit-bang recovery routine...");
+    ESP_LOGW(TAG, "Executing structured hardware + software I2C recovery routine...");
 
     if (xSemaphoreTake(i2c_mutex, portMAX_DELAY) == pdTRUE) {
+        // 1. Tear down existing ESP-IDF I2C handles safely
         for (int i = 0; i < 4; i++) {
             if (ads_handles[i] != NULL) { i2c_master_bus_rm_device(ads_handles[i]); ads_handles[i] = NULL; }
         }
         if (ds3231_handle != NULL) { i2c_master_bus_rm_device(ds3231_handle); ds3231_handle = NULL; }
         if (bus_handle != NULL) { i2c_del_master_bus(bus_handle); bus_handle = NULL; }
 
+        // 2. HARDWARE RESET THE TCA4307 BUFFER GATE (GPIO 15)
+        ESP_LOGW(TAG, "Cycling TCA4307 EN pin (GPIO %d) LOW -> HIGH to clear locked gate...", TCA4307_EN_GPIO);
+        gpio_set_level(TCA4307_EN_GPIO, 0); // Cut power to TCA4307 internal state machine
+        vTaskDelay(pdMS_TO_TICKS(25));      // Hold LOW for 25ms to fully discharge fault latch
+        gpio_set_level(TCA4307_EN_GPIO, 1); // Re-enable TCA4307 and trigger 1V pre-charge
+        vTaskDelay(pdMS_TO_TICKS(25));      // Wait 25ms for internal switches to settle
+
+        // 3. SOFTWARE BIT-BANG 9 CLOCK PULSES + STOP CONDITION
         gpio_config_t bb_cfg = {
             .pin_bit_mask = (1ULL << I2C_MASTER_SDA_IO) | (1ULL << I2C_MASTER_SCL_IO),
             .mode = GPIO_MODE_INPUT_OUTPUT_OD, 
@@ -399,6 +413,7 @@ static void recover_i2c_bus(void) {
             gpio_set_level(I2C_MASTER_SCL_IO, 1); vTaskDelay(pdMS_TO_TICKS(5));
         }
 
+        // Generate explicit I2C STOP condition
         gpio_set_level(I2C_MASTER_SDA_IO, 0); vTaskDelay(pdMS_TO_TICKS(5));
         gpio_set_level(I2C_MASTER_SCL_IO, 1); vTaskDelay(pdMS_TO_TICKS(5));
         gpio_set_level(I2C_MASTER_SDA_IO, 1); vTaskDelay(pdMS_TO_TICKS(5));
@@ -406,10 +421,11 @@ static void recover_i2c_bus(void) {
         gpio_reset_pin(I2C_MASTER_SDA_IO);
         gpio_reset_pin(I2C_MASTER_SCL_IO);
 
+        // 4. Re-initialize ESP32 I2C Master peripheral and restore RTC
         if (i2c_master_init() == ESP_OK) {
             i2c_device_config_t ds_cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = DS3231_ADDR, .scl_speed_hz = I2C_MASTER_FREQ_HZ };
             i2c_master_bus_add_device(bus_handle, &ds_cfg, &ds3231_handle);
-            ESP_LOGI(TAG, "Hardware core I2C registers and RTC restored.");
+            ESP_LOGI(TAG, "Hardware core I2C registers, TCA4307 gate, and RTC restored.");
         } else {
             ESP_LOGE(TAG, "Fatal fault re-instantiating core hardware I2C master bus.");
         }
@@ -418,11 +434,20 @@ static void recover_i2c_bus(void) {
 }
 
 // ==========================================
-// NON-DESTRUCTIVE SMART I2C SCANNING
+// NON-DESTRUCTIVE SMART I2C SCANNING & SELF-HEALING
 // ==========================================
-static void scan_i2c_bus(void) {
+static uint8_t perform_i2c_probe_pass(bool *rtc_ok) {
     uint8_t found_this_run = 0;
+    *rtc_ok = false;
+
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (bus_handle != NULL) {
+            // Probe onboard DS3231 RTC (0x68) to verify the PCB I2C peripheral isn't wedged
+            if (i2c_master_probe(bus_handle, DS3231_ADDR, 100) == ESP_OK) {
+                *rtc_ok = true;
+            }
+        }
+
         if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
             for (int i = 0; i < 4; i++) {
                 if (bus_handle == NULL) break;
@@ -430,13 +455,23 @@ static void scan_i2c_bus(void) {
                 
                 if (probe_err == ESP_OK) {
                     if (ads_handles[i] == NULL) {
-                        i2c_device_config_t dev_cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = possible_addresses[i], .scl_speed_hz = I2C_MASTER_FREQ_HZ };
+                        i2c_device_config_t dev_cfg = {
+                            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+                            .device_address = possible_addresses[i],
+                            .scl_speed_hz = I2C_MASTER_FREQ_HZ
+                        };
                         i2c_master_bus_add_device(bus_handle, &dev_cfg, &ads_handles[i]);
                     }
-                    global_node_data[i].address = possible_addresses[i]; global_node_data[i].is_online = true; found_this_run++;
+                    global_node_data[i].address = possible_addresses[i];
+                    global_node_data[i].is_online = true;
+                    found_this_run++;
                 } else {
-                    if (ads_handles[i] != NULL) { i2c_master_bus_rm_device(ads_handles[i]); ads_handles[i] = NULL; }
-                    global_node_data[i].address = possible_addresses[i]; global_node_data[i].is_online = false;
+                    if (ads_handles[i] != NULL) {
+                        i2c_master_bus_rm_device(ads_handles[i]);
+                        ads_handles[i] = NULL;
+                    }
+                    global_node_data[i].address = possible_addresses[i];
+                    global_node_data[i].is_online = false;
                     memset(global_node_data[i].port_values, 0, sizeof(global_node_data[i].port_values));
                 }
             }
@@ -449,12 +484,40 @@ static void scan_i2c_bus(void) {
         }
         xSemaphoreGive(i2c_mutex);
     }
+    return found_this_run;
+}
+
+static void scan_i2c_bus(void) {
+    bool rtc_ok = true;
+    uint8_t found = perform_i2c_probe_pass(&rtc_ok);
+
+    // Rate-limited failsafe when 0 ADS1115 chips are detected
+    if (found == 0) {
+        TickType_t now = xTaskGetTickCount();
+        bool cooldown_expired = ((now - last_zero_chip_recovery_tick) >= pdMS_TO_TICKS(I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS));
+
+        // Recover immediately if the onboard RTC is unreachable (bus wedged) OR once every 10s
+        if (!rtc_ok || cooldown_expired) {
+            last_zero_chip_recovery_tick = now;
+            ESP_LOGW(TAG, "0 ADS chips detected (RTC_Alive=%d). Triggering rate-limited I2C recovery...", rtc_ok);
+            
+            recover_i2c_bus();
+            vTaskDelay(pdMS_TO_TICKS(150)); // Let TCA4307 pre-charge and 5V rail settle
+            
+            // Re-probe immediately so newly snapped-in boards come online right away
+            perform_i2c_probe_pass(&rtc_ok);
+        }
+    }
 }
 
 static esp_err_t i2c_master_init(void) {
     i2c_master_bus_config_t i2c_mst_config = {
-        .clk_source = I2C_CLK_SRC_DEFAULT, .i2c_port = -1, .scl_io_num = I2C_MASTER_SCL_IO, .sda_io_num = I2C_MASTER_SDA_IO,
-        .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = true,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = I2C_NUM_0,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
     return i2c_new_master_bus(&i2c_mst_config, &bus_handle);
 }
@@ -822,7 +885,7 @@ static void configure_mqtt_client(void) {
     mqtt_cfg.session.last_will.msg     = "{\"t\":\"lwt\",\"status\":\"offline\"}";
     mqtt_cfg.session.last_will.qos     = 1;
     mqtt_cfg.session.last_will.retain  = 1;
-    mqtt_cfg.session.keepalive        = MQTT_KEEPALIVE_SEC;
+    mqtt_cfg.session.keepalive         = MQTT_KEEPALIVE_SEC;
 
     if (current_route_state == ROUTE_CLOUD) {
         mqtt_cfg.broker.address.uri = pri_broker_uri;
@@ -1101,15 +1164,35 @@ static bool is_sensor_attached(int16_t raw_value) {
 }
 
 void discovery_builder_task(void *pvParameter) {
-    uint32_t last_detailed_topology = 0xFFFFFFFF; static TickType_t last_disco_publish = 0;
+    uint32_t last_detailed_topology = 0xFFFFFFFF;
+    static TickType_t last_disco_publish = 0;
 
     while (1) {
-        if (!is_mqtt_connected) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+        // Wake every 3 seconds for fast hot-plug detection, or immediately on a drop event
+        EventBits_t bits = xEventGroupWaitBits(
+            s_hardware_event_group,
+            I2C_RESCAN_REQUIRED_BIT,
+            pdTRUE,
+            pdFALSE,
+            pdMS_TO_TICKS(I2C_FAST_SCAN_INTERVAL_MS)
+        );
+        if (bits & I2C_RESCAN_REQUIRED_BIT) {
+            vTaskDelay(pdMS_TO_TICKS(200)); 
+        }
 
-        EventBits_t bits = xEventGroupWaitBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT, pdTRUE, pdFALSE, pdMS_TO_TICKS(DISCOVERY_HEARTBEAT_MS));
-        if (bits & I2C_RESCAN_REQUIRED_BIT) vTaskDelay(pdMS_TO_TICKS(200)); 
-
+        // Always scan locally so SYSTEM_LED_FAULT and LittleFS spooling stay updated
         scan_i2c_bus();
+
+        // Give ads_reader_task 100ms to read newly discovered chips before building topology
+        if (num_ads_found > 0) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        // Only proceed to publish if MQTT is actively connected
+        if (!is_mqtt_connected || mqtt_client == NULL) {
+            continue;
+        }
+
         uint32_t current_detailed_topology = 0x00000000;
         bool local_port_connected_map[4][4] = { {false} };
 
@@ -1135,7 +1218,8 @@ void discovery_builder_task(void *pvParameter) {
 
         if (!topology_changed && !heartbeat_due) continue; 
         
-        last_detailed_topology = current_detailed_topology; last_disco_publish = xTaskGetTickCount();
+        last_detailed_topology = current_detailed_topology;
+        last_disco_publish = xTaskGetTickCount();
 
         cJSON *root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "t", "disco"); cJSON_AddNumberToObject(root, "v", 1);
