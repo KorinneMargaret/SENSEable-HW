@@ -52,7 +52,7 @@ static const char *TAG = "THESIS_NODE";
 #define SYSTEM_LED_NET            14
 #define SYSTEM_LED_FAULT          23
 #define EJECT_BUTTON_GPIO         34 // The Safe Eject Slide Switch
-#define PROVISION_SWITCH_GPIO     32  // The Wi-Fi Provisioning AP Switch
+#define PROVISION_SWITCH_GPIO     32 // The Wi-Fi Provisioning AP Switch
 
 // ==========================================
 // TIMING & NETWORK TIMEOUT CONFIGURATIONS
@@ -154,11 +154,11 @@ char tenant_id[32] = DEFAULT_TENANT_ID;
 // ==========================================
 // I2C & HARDWARE GLOBALS
 // ==========================================
-#define I2C_MASTER_SDA_IO  21
-#define I2C_MASTER_SCL_IO  22
-#define TCA4307_EN_GPIO    15   // LLC-Boosted Hardware Gate
-#define I2C_MASTER_FREQ_HZ 100000
-#define DS3231_ADDR        0x68
+#define I2C_MASTER_SDA_IO   21
+#define I2C_MASTER_SCL_IO   22
+#define TCA4307_EN_GPIO     15   // LLC-Boosted Hardware Gate
+#define I2C_MASTER_FREQ_HZ  100000
+#define DS3231_ADDR         0x68
 #define REG_POINTER_CONVERT 0x00
 #define REG_POINTER_CONFIG  0x01
 
@@ -261,7 +261,7 @@ static time_t get_rtc_epoch(void) {
     time_t epoch = 0;
 
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (i2c_master_transmit_receive(ds3231_handle, &reg, 1, data, 7, 100) == ESP_OK) {
+        if (ds3231_handle != NULL && i2c_master_transmit_receive(ds3231_handle, &reg, 1, data, 7, 100) == ESP_OK) {
             struct tm t;
             t.tm_sec  = bcd2dec(data[0] & 0x7F);
             t.tm_min  = bcd2dec(data[1]);
@@ -309,11 +309,11 @@ static void send_command_ack(const char *cid, const char *action, const char *st
 // ==========================================
 static void init_actuators(void) {
     ledc_timer_config_t ledc_timer = {
-        .speed_mode       = ACTUATOR_LEDC_MODE,
-        .timer_num        = ACTUATOR_LEDC_TIMER,
-        .duty_resolution  = ACTUATOR_LEDC_RES,
-        .freq_hz          = ACTUATOR_LEDC_FREQ,
-        .clk_cfg          = LEDC_AUTO_CLK
+        .speed_mode      = ACTUATOR_LEDC_MODE,
+        .timer_num       = ACTUATOR_LEDC_TIMER,
+        .duty_resolution = ACTUATOR_LEDC_RES,
+        .freq_hz         = ACTUATOR_LEDC_FREQ,
+        .clk_cfg         = LEDC_AUTO_CLK
     };
     ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
 
@@ -374,6 +374,10 @@ static void init_littlefs(void) {
 // ==========================================
 static void recover_i2c_bus(void) {
     ESP_LOGW(TAG, "Executing structured hardware + software I2C recovery routine...");
+
+    // Synchronize the recovery cooldown timestamp globally so scan_i2c_bus() 
+    // and ads_reader_task() never trigger back-to-back redundant resets
+    last_zero_chip_recovery_tick = xTaskGetTickCount();
 
     if (xSemaphoreTake(i2c_mutex, portMAX_DELAY) == pdTRUE) {
         // Tear down existing ESP-IDF I2C handles safely
@@ -561,7 +565,7 @@ void eject_button_task(void *pvParameter) {
 }
 
 // ==========================================
-// ACTIVE RESPONSIVE ADS1115 POLLING TASK
+// ACTIVE RESPONSIVE ADS1115 POLLING TASK (ATOMIC)
 // ==========================================
 static uint8_t evaluate_port_status(int16_t raw_value) {
     if (raw_value == -9999) return 3; 
@@ -571,13 +575,14 @@ static uint8_t evaluate_port_status(int16_t raw_value) {
 }
 
 void ads_reader_task(void *pvParameter) {
+    int consecutive_bus_errors = 0;
+
     while (1) {
         if (safe_eject_active) {
+            consecutive_bus_errors = 0;
             vTaskDelay(pdMS_TO_TICKS(500));
             continue; // Do not poll the bus while the user is physically hot-swapping
         }
-
-        bool structural_drop_detected = false;
 
         for (int i = 0; i < 4; i++) {
             if (ads_handles[i] == NULL || !global_node_data[i].is_online) continue;
@@ -591,42 +596,56 @@ void ads_reader_task(void *pvParameter) {
                     case 2: config_msb = 0xE3; break; case 3: config_msb = 0xF3; break;
                 }
                 uint8_t config_data[3] = {REG_POINTER_CONFIG, config_msb, 0x83};
-                uint8_t reg_pointer = REG_POINTER_CONVERT; uint8_t read_buf[2];
+                uint8_t reg_pointer = REG_POINTER_CONVERT; 
+                uint8_t read_buf[2];
+                int16_t final_val = -9999;
 
-                if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    esp_err_t tx_err = ESP_FAIL;
-                    if (ads_handles[i] != NULL) tx_err = i2c_master_transmit(ads_handles[i], config_data, sizeof(config_data), 100);
-                    xSemaphoreGive(i2c_mutex);
-
-                    if (tx_err != ESP_OK) {
-                        if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
-                            global_node_data[i].port_values[channel] = -9999; xSemaphoreGive(data_mutex);
-                        }
-                        structural_drop_detected = true; continue; 
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(10));
-
-                    if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                        esp_err_t rx_err = ESP_FAIL;
-                        if (ads_handles[i] != NULL) rx_err = i2c_master_transmit_receive(ads_handles[i], &reg_pointer, 1, read_buf, sizeof(read_buf), 100);
+                // Acquire I2C mutex for the ENTIRE write-wait-read cycle (atomic transaction)
+                if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    // Secondary NULL check inside mutex prevents Use-After-Free if recovery ran
+                    if (ads_handles[i] == NULL) {
                         xSemaphoreGive(i2c_mutex);
-
-                        int16_t final_val = -9999;
-                        if (rx_err == ESP_OK) final_val = (read_buf[0] << 8) | read_buf[1];
-                        else structural_drop_detected = true;
-
-                        if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
-                            global_node_data[i].port_values[channel] = final_val; xSemaphoreGive(data_mutex);
-                        }
+                        break; 
                     }
+
+                    esp_err_t tx_err = i2c_master_transmit(ads_handles[i], config_data, sizeof(config_data), 100);
+                    if (tx_err == ESP_OK) {
+                        // Hold mutex for 15ms while ADS1115 completes single-shot conversion
+                        vTaskDelay(pdMS_TO_TICKS(15));
+
+                        esp_err_t rx_err = i2c_master_transmit_receive(ads_handles[i], &reg_pointer, 1, read_buf, sizeof(read_buf), 100);
+                        if (rx_err == ESP_OK) {
+                            final_val = (read_buf[0] << 8) | read_buf[1];
+                            consecutive_bus_errors = 0;
+                        } else {
+                            consecutive_bus_errors++;
+                        }
+                    } else {
+                        consecutive_bus_errors++;
+                    }
+                    xSemaphoreGive(i2c_mutex);
+                } else {
+                    // Could not acquire mutex within 100ms; skip overwriting port data this pass
+                    continue;
+                }
+
+                if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
+                    global_node_data[i].port_values[channel] = final_val;
+                    xSemaphoreGive(data_mutex);
                 }
             }
         }
-        if (structural_drop_detected && !safe_eject_active) {
-            ESP_LOGW(TAG, "Hardware link drop caught! Triggering inline bit-bang recovery routine...");
-            recover_i2c_bus(); xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+
+        // Only trigger hardware recovery if 8 consecutive channel operations fail
+        if (consecutive_bus_errors >= 8 && !safe_eject_active) {
+            ESP_LOGW(TAG, "Sustained I2C deadlock caught (%d consecutive errors)! Triggering inline recovery...", consecutive_bus_errors);
+            consecutive_bus_errors = 0;
+            last_zero_chip_recovery_tick = xTaskGetTickCount();
+            recover_i2c_bus();
+            xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
             vTaskDelay(pdMS_TO_TICKS(5000));
         }
+
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -963,6 +982,7 @@ void cloud_watchdog_task(void *pvParameter) {
 static void ppp_ip_event_handler(void *arg, esp_event_base_t base, int32_t event_id, void *event_data) {
     if (event_id == IP_EVENT_PPP_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        (void)event;
         esp_netif_dns_info_t dns_info = {0}; dns_info.ip.type = ESP_IPADDR_TYPE_V4;
         esp_netif_str_to_ip4("8.8.8.8", &dns_info.ip.u_addr.ip4);
         esp_netif_set_dns_info(ppp_netif, ESP_NETIF_DNS_MAIN, &dns_info);
