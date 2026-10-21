@@ -47,18 +47,20 @@
 static const char *TAG = "THESIS_NODE";
 
 // ==========================================
-// SYSTEM LED INDICATORS
+// SYSTEM LED INDICATORS & BUTTONS
 // ==========================================
 #define SYSTEM_LED_NET            14
 #define SYSTEM_LED_FAULT          23
+#define EJECT_BUTTON_GPIO         34 // The Safe Eject Slide Switch
+#define PROVISION_SWITCH_GPIO     32  // The Wi-Fi Provisioning AP Switch
 
 // ==========================================
 // TIMING & NETWORK TIMEOUT CONFIGURATIONS
 // ==========================================
 #define TELEMETRY_INTERVAL_MS               10000
 #define DISCOVERY_HEARTBEAT_MS              60000
-#define I2C_FAST_SCAN_INTERVAL_MS           3000  // Fast 3s local hardware scan for hot-plugging
-#define I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS  10000 // Max 1 recovery per 10s when 0 chips are connected
+#define I2C_FAST_SCAN_INTERVAL_MS           3000  
+#define I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS  10000 
 
 // --- Cloud & MQTT Timers ---
 #define MQTT_NETWORK_TIMEOUT_MS             60000 
@@ -75,7 +77,6 @@ static const char *TAG = "THESIS_NODE";
 #define CELLULAR_PPP_DROP_TIMEOUT_SEC       30    
 #define CELLULAR_MQTT_OFFLINE_TIMEOUT_SEC   180   
 
-#define PROVISION_SWITCH_GPIO     32 
 #define SPOOL_FILE_PATH           "/fs/telemetry_spool.jsonl"
 #define FLOATING_LEAK_MIN         4500
 #define FLOATING_LEAK_MAX         5000
@@ -138,6 +139,7 @@ static RoutingState_t current_route_state = ROUTE_CLOUD;
 static int cloud_disconnect_count = 0;
 volatile bool is_mqtt_connected = false;
 volatile bool trigger_failover = false;
+volatile bool safe_eject_active = false; // Tracks if the user locked the bus via the Slide Switch
 
 // ==========================================
 // DYNAMIC CREDENTIAL ARRAYS
@@ -154,7 +156,7 @@ char tenant_id[32] = DEFAULT_TENANT_ID;
 // ==========================================
 #define I2C_MASTER_SDA_IO  21
 #define I2C_MASTER_SCL_IO  22
-#define TCA4307_EN_GPIO    15   // <--- INSERT THIS LINE
+#define TCA4307_EN_GPIO    15   // LLC-Boosted Hardware Gate
 #define I2C_MASTER_FREQ_HZ 100000
 #define DS3231_ADDR        0x68
 #define REG_POINTER_CONVERT 0x00
@@ -198,11 +200,11 @@ static void configure_mqtt_client(void);
 static esp_err_t i2c_master_init(void);
 
 // ==========================================
-// STATUS LED INITIALIZATION & TASKS
+// STATUS LED & HARDWARE GATE INITIALIZATION
 // ==========================================
 static void init_system_leds(void) {
     gpio_config_t led_cfg = {
-        .pin_bit_mask = (1ULL << SYSTEM_LED_NET) | (1ULL << SYSTEM_LED_FAULT),
+        .pin_bit_mask = (1ULL << SYSTEM_LED_NET) | (1ULL << SYSTEM_LED_FAULT) | (1ULL << TCA4307_EN_GPIO),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -211,7 +213,7 @@ static void init_system_leds(void) {
     gpio_config(&led_cfg);
     gpio_set_level(SYSTEM_LED_NET, 0);
     gpio_set_level(SYSTEM_LED_FAULT, 0);
-    gpio_set_level(TCA4307_EN_GPIO, 1); // <--- INSERT THIS: Keep TCA4307 gate ON by default
+    gpio_set_level(TCA4307_EN_GPIO, 1); // Keep TCA4307 gate ON by default
 }
 
 void network_led_task(void *pvParameter) {
@@ -244,12 +246,6 @@ static void build_mqtt_topics(void) {
     sprintf(topic_disco,  "%s/%s/%s/disco",  MQTT_TOPIC_ROOT, tenant_id, node_id);
     sprintf(topic_status, "%s/%s/%s/status", MQTT_TOPIC_ROOT, tenant_id, node_id);
     sprintf(topic_config, "%s/%s/%s/config", MQTT_TOPIC_ROOT, tenant_id, node_id);
-
-    ESP_LOGI(TAG, "====================================");
-    ESP_LOGI(TAG, "PROVISIONED AS: %s / %s", tenant_id, node_id);
-    ESP_LOGI(TAG, "Command Topic: %s", topic_cmd);
-    ESP_LOGI(TAG, "Telemetry Topic: %s", topic_tlm);
-    ESP_LOGI(TAG, "====================================");
 }
 
 // ==========================================
@@ -303,7 +299,6 @@ static void send_command_ack(const char *cid, const char *action, const char *st
     char *payload = cJSON_PrintUnformatted(ack_root);
     if (payload != NULL) {
         esp_mqtt_client_publish(mqtt_client, topic_ack, payload, 0, 1, 0);
-        ESP_LOGI(TAG, "Command ACK published -> Status: %s | Action: %s | ID: %s", status, action ? action : "unknown", cid ? cid : "unknown");
         free(payload);
     }
     cJSON_Delete(ack_root);
@@ -344,7 +339,6 @@ static void init_actuators(void) {
         };
         ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
     }
-    ESP_LOGI(TAG, "Hardware driver arrays linked and operational (OUT1-OUT8).");
 }
 
 void auto_shutoff_task(void *pvParameter) {
@@ -356,7 +350,6 @@ void auto_shutoff_task(void *pvParameter) {
     ledc_stop(ACTUATOR_LEDC_MODE, mapped_chan, 0);
     gpio_set_level(mapped_gpio, 0);
     
-    ESP_LOGW(TAG, ">>> Auto-shutoff triggered for OUT%d after %d ms <<<", args->target_idx + 1, args->duration_ms);
     send_command_ack(args->cid, "actuate", "completed", "Auto-shutoff execution window expired safely");
 
     if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
@@ -373,31 +366,31 @@ static void init_littlefs(void) {
     esp_vfs_littlefs_conf_t conf = {
         .base_path = "/fs", .partition_label = "spiffs", .format_if_mount_failed = true, .dont_mount = false,
     };
-    if (esp_vfs_littlefs_register(&conf) == ESP_OK) ESP_LOGI(TAG, "LittleFS mounted for WAN offline buffering.");
+    esp_vfs_littlefs_register(&conf);
 }
 
 // ==========================================
-// BIT-BANG & HARDWARE GATE I2C BUS RECOVERY ROUTINE
+// BIT-BANG & HARDWARE GATE I2C BUS RECOVERY
 // ==========================================
 static void recover_i2c_bus(void) {
     ESP_LOGW(TAG, "Executing structured hardware + software I2C recovery routine...");
 
     if (xSemaphoreTake(i2c_mutex, portMAX_DELAY) == pdTRUE) {
-        // 1. Tear down existing ESP-IDF I2C handles safely
+        // Tear down existing ESP-IDF I2C handles safely
         for (int i = 0; i < 4; i++) {
             if (ads_handles[i] != NULL) { i2c_master_bus_rm_device(ads_handles[i]); ads_handles[i] = NULL; }
         }
         if (ds3231_handle != NULL) { i2c_master_bus_rm_device(ds3231_handle); ds3231_handle = NULL; }
         if (bus_handle != NULL) { i2c_del_master_bus(bus_handle); bus_handle = NULL; }
 
-        // 2. HARDWARE RESET THE TCA4307 BUFFER GATE (GPIO 15)
+        // HARDWARE RESET THE TCA4307 BUFFER GATE (GPIO 15)
         ESP_LOGW(TAG, "Cycling TCA4307 EN pin (GPIO %d) LOW -> HIGH to clear locked gate...", TCA4307_EN_GPIO);
         gpio_set_level(TCA4307_EN_GPIO, 0); // Cut power to TCA4307 internal state machine
         vTaskDelay(pdMS_TO_TICKS(25));      // Hold LOW for 25ms to fully discharge fault latch
         gpio_set_level(TCA4307_EN_GPIO, 1); // Re-enable TCA4307 and trigger 1V pre-charge
         vTaskDelay(pdMS_TO_TICKS(25));      // Wait 25ms for internal switches to settle
 
-        // 3. SOFTWARE BIT-BANG 9 CLOCK PULSES + STOP CONDITION
+        // SOFTWARE BIT-BANG 9 CLOCK PULSES + STOP CONDITION
         gpio_config_t bb_cfg = {
             .pin_bit_mask = (1ULL << I2C_MASTER_SDA_IO) | (1ULL << I2C_MASTER_SCL_IO),
             .mode = GPIO_MODE_INPUT_OUTPUT_OD, 
@@ -413,7 +406,6 @@ static void recover_i2c_bus(void) {
             gpio_set_level(I2C_MASTER_SCL_IO, 1); vTaskDelay(pdMS_TO_TICKS(5));
         }
 
-        // Generate explicit I2C STOP condition
         gpio_set_level(I2C_MASTER_SDA_IO, 0); vTaskDelay(pdMS_TO_TICKS(5));
         gpio_set_level(I2C_MASTER_SCL_IO, 1); vTaskDelay(pdMS_TO_TICKS(5));
         gpio_set_level(I2C_MASTER_SDA_IO, 1); vTaskDelay(pdMS_TO_TICKS(5));
@@ -421,7 +413,7 @@ static void recover_i2c_bus(void) {
         gpio_reset_pin(I2C_MASTER_SDA_IO);
         gpio_reset_pin(I2C_MASTER_SCL_IO);
 
-        // 4. Re-initialize ESP32 I2C Master peripheral and restore RTC
+        // Re-initialize ESP32 I2C Master peripheral and restore RTC
         if (i2c_master_init() == ESP_OK) {
             i2c_device_config_t ds_cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = DS3231_ADDR, .scl_speed_hz = I2C_MASTER_FREQ_HZ };
             i2c_master_bus_add_device(bus_handle, &ds_cfg, &ds3231_handle);
@@ -434,7 +426,7 @@ static void recover_i2c_bus(void) {
 }
 
 // ==========================================
-// NON-DESTRUCTIVE SMART I2C SCANNING & SELF-HEALING
+// NON-DESTRUCTIVE SMART I2C SCANNING 
 // ==========================================
 static uint8_t perform_i2c_probe_pass(bool *rtc_ok) {
     uint8_t found_this_run = 0;
@@ -442,7 +434,6 @@ static uint8_t perform_i2c_probe_pass(bool *rtc_ok) {
 
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         if (bus_handle != NULL) {
-            // Probe onboard DS3231 RTC (0x68) to verify the PCB I2C peripheral isn't wedged
             if (i2c_master_probe(bus_handle, DS3231_ADDR, 100) == ESP_OK) {
                 *rtc_ok = true;
             }
@@ -477,8 +468,10 @@ static uint8_t perform_i2c_probe_pass(bool *rtc_ok) {
             }
             num_ads_found = found_this_run;
             
-            // Trigger Fault LED dynamically based on sensor availability
-            gpio_set_level(SYSTEM_LED_FAULT, (num_ads_found == 0) ? 1 : 0);
+            // Only toggle Fault LED if Safe Eject is NOT active
+            if (!safe_eject_active) {
+                gpio_set_level(SYSTEM_LED_FAULT, (num_ads_found == 0) ? 1 : 0);
+            }
 
             xSemaphoreGive(data_mutex);
         }
@@ -488,23 +481,20 @@ static uint8_t perform_i2c_probe_pass(bool *rtc_ok) {
 }
 
 static void scan_i2c_bus(void) {
+    // Suspend automated scanning completely if the user locked the bus via Safe Eject
+    if (safe_eject_active) return;
+
     bool rtc_ok = true;
     uint8_t found = perform_i2c_probe_pass(&rtc_ok);
 
-    // Rate-limited failsafe when 0 ADS1115 chips are detected
     if (found == 0) {
         TickType_t now = xTaskGetTickCount();
         bool cooldown_expired = ((now - last_zero_chip_recovery_tick) >= pdMS_TO_TICKS(I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS));
 
-        // Recover immediately if the onboard RTC is unreachable (bus wedged) OR once every 10s
         if (!rtc_ok || cooldown_expired) {
             last_zero_chip_recovery_tick = now;
-            ESP_LOGW(TAG, "0 ADS chips detected (RTC_Alive=%d). Triggering rate-limited I2C recovery...", rtc_ok);
-            
             recover_i2c_bus();
-            vTaskDelay(pdMS_TO_TICKS(150)); // Let TCA4307 pre-charge and 5V rail settle
-            
-            // Re-probe immediately so newly snapped-in boards come online right away
+            vTaskDelay(pdMS_TO_TICKS(150)); 
             perform_i2c_probe_pass(&rtc_ok);
         }
     }
@@ -523,6 +513,54 @@ static esp_err_t i2c_master_init(void) {
 }
 
 // ==========================================
+// THE SAFE EJECT PHYSICAL SLIDE SWITCH TASK
+// ==========================================
+void eject_button_task(void *pvParameter) {
+    gpio_config_t btn_cfg = {
+        .pin_bit_mask = (1ULL << EJECT_BUTTON_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE, // MUST be disabled for GPIO 34
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&btn_cfg);
+
+    // Track the physical position of the slider
+    bool last_switch_state = (gpio_get_level(EJECT_BUTTON_GPIO) == 0);
+
+    while (1) {
+        // If the switch connects to GND, level is 0 (CLOSED)
+        bool current_switch_state = (gpio_get_level(EJECT_BUTTON_GPIO) == 0);
+
+        // Detect if the user moved the slide switch
+        if (current_switch_state != last_switch_state) {
+            vTaskDelay(pdMS_TO_TICKS(50)); // Debounce the mechanical slide
+            
+            if (gpio_get_level(EJECT_BUTTON_GPIO) == 0 && current_switch_state) {
+                // Switch is CLOSED (Connected to GND)
+                safe_eject_active = true;
+                ESP_LOGW(TAG, ">>> SAFE EJECT ACTIVATED: Locking Hardware Gate (GPIO 15) <<<");
+                gpio_set_level(TCA4307_EN_GPIO, 0);  // Drop the physical hardware gate
+                gpio_set_level(SYSTEM_LED_FAULT, 1); // Solid Fault LED = "Safe to swap"
+            } 
+            else if (gpio_get_level(EJECT_BUTTON_GPIO) == 1 && !current_switch_state) {
+                // Switch is OPEN (Disconnected, pulled HIGH to 3.3V)
+                safe_eject_active = false;
+                ESP_LOGI(TAG, ">>> SAFE EJECT DEACTIVATED: Opening Gate and Scanning <<<");
+                gpio_set_level(TCA4307_EN_GPIO, 1);  // Raise the gate
+                gpio_set_level(SYSTEM_LED_FAULT, 0);
+                vTaskDelay(pdMS_TO_TICKS(150));      // Let the TCA4307 gate settle
+                
+                // Immediately scan for whatever boards the user just plugged in
+                xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+            }
+            last_switch_state = current_switch_state;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// ==========================================
 // ACTIVE RESPONSIVE ADS1115 POLLING TASK
 // ==========================================
 static uint8_t evaluate_port_status(int16_t raw_value) {
@@ -534,6 +572,11 @@ static uint8_t evaluate_port_status(int16_t raw_value) {
 
 void ads_reader_task(void *pvParameter) {
     while (1) {
+        if (safe_eject_active) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue; // Do not poll the bus while the user is physically hot-swapping
+        }
+
         bool structural_drop_detected = false;
 
         for (int i = 0; i < 4; i++) {
@@ -579,7 +622,7 @@ void ads_reader_task(void *pvParameter) {
                 }
             }
         }
-        if (structural_drop_detected) {
+        if (structural_drop_detected && !safe_eject_active) {
             ESP_LOGW(TAG, "Hardware link drop caught! Triggering inline bit-bang recovery routine...");
             recover_i2c_bus(); xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
             vTaskDelay(pdMS_TO_TICKS(5000));
@@ -602,10 +645,8 @@ static void process_incoming_command(const char *json_string, size_t length) {
         return;
     }
 
-    // 1. Strict CID Validation & Safe Copy
     cJSON *cid_item = cJSON_GetObjectItem(root, "cid");
     if (!cJSON_IsString(cid_item) || (cid_item->valuestring == NULL) || (strlen(cid_item->valuestring) == 0)) {
-        ESP_LOGW(TAG, "Command rejected: missing or invalid 'cid'");
         cJSON_Delete(root);
         return;
     }
@@ -613,10 +654,8 @@ static void process_incoming_command(const char *json_string, size_t length) {
     char cid_buf[MAX_CID_LEN];
     snprintf(cid_buf, sizeof(cid_buf), "%s", cid_item->valuestring);
 
-    // 2. Strict Action Check
     cJSON *act_item = cJSON_GetObjectItem(root, "action");
     if (!cJSON_IsString(act_item) || (act_item->valuestring == NULL)) {
-        ESP_LOGW(TAG, "Command rejected: missing or invalid 'action'");
         send_command_ack(cid_buf, "unknown", "failed", "Missing or invalid 'action' field");
         cJSON_Delete(root);
         return;
@@ -624,19 +663,12 @@ static void process_incoming_command(const char *json_string, size_t length) {
 
     const char *action = act_item->valuestring;
 
-    // --- ACTION: BUS RECOVERY ---
     if (strcmp(action, "bus_recovery") == 0) {
-        cJSON *bus_id_item = cJSON_GetObjectItem(root, "bus_id");
-        int target_bus = cJSON_IsNumber(bus_id_item) ? bus_id_item->valueint : 0;
-
-        ESP_LOGI(TAG, "Schema payload validated for Bus %d. Executing recovery routine...", target_bus);
         send_command_ack(cid_buf, action, "started", "Beginning I2C recovery cycle");
         recover_i2c_bus();
         xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
         send_command_ack(cid_buf, action, "completed", "I2C bus recovery complete");
     }
-
-    // --- ACTION: ACTUATE ---
     else if (strcmp(action, "actuate") == 0) {
         cJSON *port_item = cJSON_GetObjectItem(root, "port");
         cJSON *mode_item = cJSON_GetObjectItem(root, "mode");
@@ -648,7 +680,6 @@ static void process_incoming_command(const char *json_string, size_t length) {
             return;
         }
 
-        // Integer Underflow and Out-of-Bounds Guard
         int raw_port = port_item->valueint;
         if (raw_port < 1 || raw_port > NUM_ACTUATORS) {
             send_command_ack(cid_buf, action, "failed", "Port out of bounds");
@@ -659,7 +690,6 @@ static void process_incoming_command(const char *json_string, size_t length) {
         int target_idx = raw_port - 1;
         const char *mode_str = mode_item->valuestring;
 
-        // Duration Range Validation & Upper Safety Cap (Max 24h = 86,400,000 ms)
         int duration_ms = 0;
         if (cJSON_IsNumber(dur_item)) {
             if (dur_item->valueint > 0 && dur_item->valueint <= 86400000) {
@@ -680,7 +710,6 @@ static void process_incoming_command(const char *json_string, size_t length) {
                 actuator_active_state = (state_val == 1);
                 ledc_stop(ACTUATOR_LEDC_MODE, mapped_chan, state_val);
                 gpio_set_level(mapped_gpio, state_val);
-                ESP_LOGI(TAG, "Binary: OUT%d (GPIO %d) -> %d [Duration: %d ms]", target_idx + 1, mapped_gpio, state_val, duration_ms);
             } else {
                 send_command_ack(cid_buf, action, "failed", "Binary mode requires numeric 'state' (0 or 1)");
                 cJSON_Delete(root);
@@ -695,17 +724,15 @@ static void process_incoming_command(const char *json_string, size_t length) {
                 ledc_set_duty(ACTUATOR_LEDC_MODE, mapped_chan, 0);
                 ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
                 actuator_active_state = false;
-                ESP_LOGI(TAG, "PWM: OUT%d -> STOP (explicit state:0)", target_idx + 1);
             } 
             else if (cJSON_IsNumber(duty_item)) {
                 int duty_val = duty_item->valueint;
                 if (duty_val < 0) duty_val = 0;
-                if (duty_val > 255) duty_val = 255; // Clamp to 8-bit resolution
+                if (duty_val > 255) duty_val = 255; 
 
                 actuator_active_state = (duty_val > 0);
                 ledc_set_duty(ACTUATOR_LEDC_MODE, mapped_chan, duty_val);
                 ledc_update_duty(ACTUATOR_LEDC_MODE, mapped_chan);
-                ESP_LOGI(TAG, "PWM: OUT%d (GPIO %d) -> Duty: %d/255 [Duration: %d ms]", target_idx + 1, mapped_gpio, duty_val, duration_ms);
             } else {
                 send_command_ack(cid_buf, action, "failed", "PWM mode requires numeric 'duty' or state:0");
                 cJSON_Delete(root);
@@ -717,12 +744,10 @@ static void process_incoming_command(const char *json_string, size_t length) {
             return;
         }
 
-        // Manage pre-existing timer tasks safely
         if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
             if (auto_shutoff_task_handles[target_idx] != NULL) {
                 vTaskDelete(auto_shutoff_task_handles[target_idx]);
                 auto_shutoff_task_handles[target_idx] = NULL;
-                ESP_LOGW(TAG, "Safely terminated legacy timed worker task on OUT%d to protect override context.", target_idx + 1);
             }
             xSemaphoreGive(task_tracking_mutex);
         }
@@ -745,8 +770,6 @@ static void process_incoming_command(const char *json_string, size_t length) {
             send_command_ack(cid_buf, action, "stopped", "Actuator set to default idle state");
         }
     }
-
-    // --- ACTION: SENSOR PORT CONFIGURATION ---
     else if (strcmp(action, "sensor_port_up") == 0 || strcmp(action, "sensor_port_down") == 0) {
         cJSON *chip_item = cJSON_GetObjectItem(root, "chip");
         cJSON *ch_item   = cJSON_GetObjectItem(root, "ch");
@@ -763,7 +786,6 @@ static void process_incoming_command(const char *json_string, size_t length) {
                     port_active[chip_idx][ch_idx] = set_active;
                     xSemaphoreGive(data_mutex);
                 }
-                ESP_LOGW(TAG, "Altered configuration: Chip Index [%d] Port [%d] -> %s", chip_idx, ch_idx, set_active ? "ENABLED" : "DISABLED");
                 xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
                 send_command_ack(cid_buf, action, "completed", "Target port map dynamically adjusted");
             } else {
@@ -813,9 +835,7 @@ static void publish_node_config(void) {
 
     char *payload = cJSON_PrintUnformatted(root);
     if (payload != NULL) {
-        // Publish config using Retain = 1 flag
         esp_mqtt_client_publish(mqtt_client, topic_config, payload, 0, 1, 1);
-        ESP_LOGI(TAG, "Hardware Configuration Synced to Cloud -> %s", payload);
         free(payload);
     }
     cJSON_Delete(root);
@@ -834,11 +854,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT); 
 
         esp_mqtt_client_subscribe(mqtt_client, topic_cmd, 1);
-        ESP_LOGI(TAG, "Subscribed to Command Topic: %s", topic_cmd);
-
         esp_mqtt_client_publish(mqtt_client, topic_status, "{\"t\":\"lwt\",\"status\":\"online\"}", 0, 1, 1);
-        
-        // Broadcast the current configuration to the web app
         publish_node_config();
     }
     else if (event_id == MQTT_EVENT_DISCONNECTED) {
@@ -847,7 +863,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
         if (current_hw_mode == HW_MODE_WIFI && current_route_state == ROUTE_CLOUD) {
             cloud_disconnect_count++;
-            ESP_LOGW(TAG, "Cloud connection attempt %d failed.", cloud_disconnect_count);
             if (cloud_disconnect_count >= MAX_CLOUD_FAILURES) {
                 ESP_LOGE(TAG, "Cloud unreachable. Flagging for safe Phase 2 Failover...");
                 trigger_failover = true;
@@ -855,18 +870,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         }
     }
     else if (event_id == MQTT_EVENT_DATA) {
-        // Enforce strict upper bound check on stack array limits
-        if (event->data_len <= 0 || event->data_len >= MAX_CMD_PAYLOAD_LEN) {
-            ESP_LOGE(TAG, "Payload size (%d bytes) exceeds allowed limits. Dropping packet.", event->data_len);
-            return;
-        }
+        if (event->data_len <= 0 || event->data_len >= MAX_CMD_PAYLOAD_LEN) return;
 
-        // Fixed stack buffer allocation (Zero Heap, No Fragmentation)
         char json_string[MAX_CMD_PAYLOAD_LEN];
         memcpy(json_string, event->data, event->data_len);
         json_string[event->data_len] = '\0';
-
-        ESP_LOGI(TAG, "Command Packet Received on [%.*s]: %s", event->topic_len, event->topic, json_string);
         process_incoming_command(json_string, (size_t)event->data_len);
     }
 }
@@ -876,11 +884,8 @@ static void configure_mqtt_client(void) {
 
     esp_mqtt_client_config_t mqtt_cfg = {0};
     mqtt_cfg.network.timeout_ms = MQTT_NETWORK_TIMEOUT_MS; 
-    
-    // Critical Fix: Ensures the broker queues commands for this specific node if the connection drops momentarily
     mqtt_cfg.credentials.client_id     = node_id;
     mqtt_cfg.session.disable_clean_session = true;
-
     mqtt_cfg.session.last_will.topic   = topic_status;
     mqtt_cfg.session.last_will.msg     = "{\"t\":\"lwt\",\"status\":\"offline\"}";
     mqtt_cfg.session.last_will.qos     = 1;
@@ -936,21 +941,16 @@ void cloud_watchdog_task(void *pvParameter) {
     while (1) {
         if (trigger_failover) {
             trigger_failover = false; 
-            ESP_LOGW(TAG, "Executing Phase 2: Local Edge Server Routing...");
             current_route_state = ROUTE_LOCAL; configure_mqtt_client();
         }
 
         if (current_hw_mode == HW_MODE_WIFI && current_route_state == ROUTE_LOCAL) {
             if ((xTaskGetTickCount() - last_cloud_ping) > pdMS_TO_TICKS(WIFI_WAN_PROBE_INTERVAL_MS)) {
                 last_cloud_ping = xTaskGetTickCount();
-                ESP_LOGI(TAG, "Watchdog probing WAN connectivity silently...");
                 
                 if (is_internet_available()) {
-                    ESP_LOGI(TAG, "Internet restored! Tearing down local socket and returning to Cloud Phase 1...");
                     current_route_state = ROUTE_CLOUD; cloud_disconnect_count = 0; configure_mqtt_client(); 
-                } else {
-                    ESP_LOGW(TAG, "Internet still down. Preserving Phase 2 local edge routing.");
-                }
+                } 
             }
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -963,14 +963,11 @@ void cloud_watchdog_task(void *pvParameter) {
 static void ppp_ip_event_handler(void *arg, esp_event_base_t base, int32_t event_id, void *event_data) {
     if (event_id == IP_EVENT_PPP_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "Cellular PPP up. IP: " IPSTR, IP2STR(&event->ip_info.ip));
         esp_netif_dns_info_t dns_info = {0}; dns_info.ip.type = ESP_IPADDR_TYPE_V4;
         esp_netif_str_to_ip4("8.8.8.8", &dns_info.ip.u_addr.ip4);
         esp_netif_set_dns_info(ppp_netif, ESP_NETIF_DNS_MAIN, &dns_info);
-        ESP_LOGI(TAG, "Forced Google DNS (8.8.8.8) to bypass carrier DNS failure.");
         xEventGroupSetBits(s_network_event_group, PPP_CONNECTED_BIT);
     } else if (event_id == IP_EVENT_PPP_LOST_IP) {
-        ESP_LOGW(TAG, "Cellular PPP lost IP.");
         xEventGroupClearBits(s_network_event_group, PPP_CONNECTED_BIT);
     }
 }
@@ -979,36 +976,19 @@ static bool modem_bring_up(void) {
     esp_modem_set_mode(modem_dce, ESP_MODEM_MODE_COMMAND);
     int tries = 0;
     while (esp_modem_sync(modem_dce) != ESP_OK) {
-        if (++tries >= MODEM_SYNC_RETRIES) {
-            ESP_LOGE(TAG, "Modem not responding on UART. Check TX/RX swap, GND, modem power.");
-            return false;
-        }
+        if (++tries >= MODEM_SYNC_RETRIES) return false;
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    ESP_LOGI(TAG, "Modem responded to AT.");
     bool pin_ok = false;
-    if (esp_modem_read_pin(modem_dce, &pin_ok) != ESP_OK || !pin_ok) {
-        ESP_LOGE(TAG, "SIM not ready (missing, locked with PIN, or bad contact).");
-        return false;
-    }
-    ESP_LOGI(TAG, "SIM ready.");
+    if (esp_modem_read_pin(modem_dce, &pin_ok) != ESP_OK || !pin_ok) return false;
 
     int rssi = 99, ber = 99; tries = 0;
     while (1) {
         if (esp_modem_get_signal_quality(modem_dce, &rssi, &ber) == ESP_OK && rssi > 0 && rssi != 99) break;
-        if (++tries >= MODEM_SIGNAL_RETRIES) {
-            ESP_LOGE(TAG, "No cellular signal (CSQ=%d). Check antenna and coverage.", rssi);
-            return false;
-        }
+        if (++tries >= MODEM_SIGNAL_RETRIES) return false;
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    ESP_LOGI(TAG, "Signal OK. CSQ=%d (~%d dBm), BER=%d", rssi, -113 + 2 * rssi, ber);
-
-    if (esp_modem_set_mode(modem_dce, ESP_MODEM_MODE_DATA) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enter PPP data mode (check APN: %s).", cellular_apn);
-        return false;
-    }
-    ESP_LOGI(TAG, "PPP data mode requested. Waiting for IP...");
+    if (esp_modem_set_mode(modem_dce, ESP_MODEM_MODE_DATA) != ESP_OK) return false;
     return true;
 }
 
@@ -1031,54 +1011,29 @@ void cellular_task(void *pvParameter) {
 #endif
 
     modem_dce = esp_modem_new_dev(ESP_MODEM_DCE_GENERIC, &dte_config, &dce_config, ppp_netif);
-    if (modem_dce == NULL) { 
-        ESP_LOGE(TAG, "esp_modem_new_dev failed.");
-        vTaskDelete(NULL); 
-        return; 
-    }
+    if (modem_dce == NULL) { vTaskDelete(NULL); return; }
 
     while (1) {
-        while (!modem_bring_up()) {
-            ESP_LOGW(TAG, "Retrying modem bring-up in %d s...", CELLULAR_BRINGUP_RETRY_MS / 1000);
-            vTaskDelay(pdMS_TO_TICKS(CELLULAR_BRINGUP_RETRY_MS));
-        }
+        while (!modem_bring_up()) { vTaskDelay(pdMS_TO_TICKS(CELLULAR_BRINGUP_RETRY_MS)); }
         
         EventBits_t bits = xEventGroupWaitBits(s_network_event_group, PPP_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(CELLULAR_NET_WAIT_TIMEOUT_MS));
-        if (!(bits & PPP_CONNECTED_BIT)) {
-            ESP_LOGE(TAG, "PPP did not get an IP within %d s. Restarting modem sequence.", CELLULAR_NET_WAIT_TIMEOUT_MS / 1000);
-            continue;
-        }
+        if (!(bits & PPP_CONNECTED_BIT)) continue;
         
         if (mqtt_client == NULL) { current_route_state = ROUTE_CLOUD; configure_mqtt_client(); }
 
         int down_seconds = 0;
         int mqtt_offline_seconds = 0;
 
-        // The Smart Watchdog Loop
         while (1) {
-            // Check 1: Did the PPP stack explicitly report a drop?
-            if (xEventGroupGetBits(s_network_event_group) & PPP_CONNECTED_BIT) {
-                down_seconds = 0; 
-            } else { 
-                down_seconds++; 
-            }
+            if (xEventGroupGetBits(s_network_event_group) & PPP_CONNECTED_BIT) down_seconds = 0; 
+            else down_seconds++; 
 
-            // Check 2: Is MQTT failing to reach the internet?
-            if (!is_mqtt_connected) {
-                mqtt_offline_seconds++;
-            } else {
-                mqtt_offline_seconds = 0;
-            }
+            if (!is_mqtt_connected) mqtt_offline_seconds++;
+            else mqtt_offline_seconds = 0;
 
-            // If PPP is formally down for threshold, OR if MQTT is totally dead for threshold (Hardware Drop)
             if (down_seconds >= CELLULAR_PPP_DROP_TIMEOUT_SEC || mqtt_offline_seconds >= CELLULAR_MQTT_OFFLINE_TIMEOUT_SEC) {
-                ESP_LOGW(TAG, "FATAL: Cellular link dead (PPP dropped or MQTT timeout). Forcing hard modem reset.");
-                
-                // Escape PPP data mode back to AT command mode
                 esp_modem_set_mode(modem_dce, ESP_MODEM_MODE_COMMAND);
                 xEventGroupClearBits(s_network_event_group, PPP_CONNECTED_BIT);
-                
-                // Break out of the watchdog loop to trigger the modem_bring_up() sequence again
                 break; 
             }
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1122,28 +1077,18 @@ void telemetry_builder_task(void *pvParameter) {
         if (is_mqtt_connected && mqtt_client != NULL) {
             char *payload_string = cJSON_PrintUnformatted(root);
             esp_mqtt_client_publish(mqtt_client, topic_tlm, payload_string, 0, 1, 0);
-            ESP_LOGI(TAG, "Live Payload Dispatched -> %s", payload_string);
             free(payload_string);
         } else if (current_hw_mode == HW_MODE_CELLULAR) {
             char *buffered_string = cJSON_PrintUnformatted(root);
-            
-            // --- NEW SAFEGUARD: Check file size before writing ---
             struct stat st;
             if (stat(SPOOL_FILE_PATH, &st) == 0) {
-                if (st.st_size > 1000000) { // 1,000,000 bytes = ~1 MB
-                    ESP_LOGE(TAG, "LittleFS spool reached 1MB limit! Wiping backlog to prevent flash corruption.");
-                    remove(SPOOL_FILE_PATH);
-                }
+                if (st.st_size > 1000000) remove(SPOOL_FILE_PATH);
             }
-            // -----------------------------------------------------
 
             FILE *f = fopen(SPOOL_FILE_PATH, "a");
             if (f != NULL) { 
                 fprintf(f, "%s\n", buffered_string); 
                 fclose(f); 
-                ESP_LOGW(TAG, "[CELLULAR DROP] Buffered to LittleFS -> %s", buffered_string);
-            } else {
-                ESP_LOGE(TAG, "Spool open failed (%s). Telemetry dropped.", SPOOL_FILE_PATH);
             }
             free(buffered_string);
         }
@@ -1157,9 +1102,7 @@ void telemetry_builder_task(void *pvParameter) {
 // ==========================================
 static bool is_sensor_attached(int16_t raw_value) {
     if (raw_value == -9999) return false; 
-    if (raw_value >= FLOATING_LEAK_MIN && raw_value <= FLOATING_LEAK_MAX) {
-        return false; 
-    }
+    if (raw_value >= FLOATING_LEAK_MIN && raw_value <= FLOATING_LEAK_MAX) return false; 
     return true; 
 }
 
@@ -1168,30 +1111,13 @@ void discovery_builder_task(void *pvParameter) {
     static TickType_t last_disco_publish = 0;
 
     while (1) {
-        // Wake every 3 seconds for fast hot-plug detection, or immediately on a drop event
-        EventBits_t bits = xEventGroupWaitBits(
-            s_hardware_event_group,
-            I2C_RESCAN_REQUIRED_BIT,
-            pdTRUE,
-            pdFALSE,
-            pdMS_TO_TICKS(I2C_FAST_SCAN_INTERVAL_MS)
-        );
-        if (bits & I2C_RESCAN_REQUIRED_BIT) {
-            vTaskDelay(pdMS_TO_TICKS(200)); 
-        }
+        EventBits_t bits = xEventGroupWaitBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT, pdTRUE, pdFALSE, pdMS_TO_TICKS(I2C_FAST_SCAN_INTERVAL_MS));
+        if (bits & I2C_RESCAN_REQUIRED_BIT) vTaskDelay(pdMS_TO_TICKS(200)); 
 
-        // Always scan locally so SYSTEM_LED_FAULT and LittleFS spooling stay updated
         scan_i2c_bus();
+        if (num_ads_found > 0) vTaskDelay(pdMS_TO_TICKS(100));
 
-        // Give ads_reader_task 100ms to read newly discovered chips before building topology
-        if (num_ads_found > 0) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-
-        // Only proceed to publish if MQTT is actively connected
-        if (!is_mqtt_connected || mqtt_client == NULL) {
-            continue;
-        }
+        if (!is_mqtt_connected || mqtt_client == NULL) continue;
 
         uint32_t current_detailed_topology = 0x00000000;
         bool local_port_connected_map[4][4] = { {false} };
@@ -1251,7 +1177,6 @@ void discovery_builder_task(void *pvParameter) {
         char *payload_string = cJSON_PrintUnformatted(root);
         if (mqtt_client != NULL && payload_string != NULL) {
             esp_mqtt_client_publish(mqtt_client, topic_disco, payload_string, 0, 1, 1);
-            ESP_LOGW(TAG, "Topology Change Caught! New Discovery Packet Dispatched: %s", payload_string);
         }
         free(payload_string); cJSON_Delete(root);
     }
@@ -1267,7 +1192,6 @@ void backlog_replay_task(void *pvParameter) {
 
         struct stat st;
         if (stat(SPOOL_FILE_PATH, &st) == 0 && st.st_size > 0) {
-            ESP_LOGW(TAG, "Cellular link restored. Initiating FIFO Backlog Replay...");
             FILE *f = fopen(SPOOL_FILE_PATH, "r");
             if (f != NULL) {
                 char line[1024];
@@ -1280,17 +1204,13 @@ void backlog_replay_task(void *pvParameter) {
 
                         if (is_mqtt_connected && mqtt_client != NULL) {
                             esp_mqtt_client_publish(mqtt_client, topic_tlm, replay_payload, 0, 1, 0);
-                            ESP_LOGI(TAG, "Replayed -> %s", replay_payload);
                             vTaskDelay(pdMS_TO_TICKS(150));
                         } else { free(replay_payload); cJSON_Delete(saved_json); break; }
                         free(replay_payload); cJSON_Delete(saved_json);
                     }
                 }
                 fclose(f);
-                if (is_mqtt_connected) {
-                    remove(SPOOL_FILE_PATH);
-                    ESP_LOGI(TAG, "Backlog replay complete. LittleFS spool cleared.");
-                }
+                if (is_mqtt_connected) remove(SPOOL_FILE_PATH);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -1303,13 +1223,9 @@ void backlog_replay_task(void *pvParameter) {
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) esp_wifi_connect();
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Wi-Fi disconnected. Retrying...");
         xEventGroupClearBits(s_network_event_group, MQTT_CONNECTED_BIT); esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Wi-Fi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         if (current_route_state == ROUTE_LOCAL && is_internet_available()) {
-            ESP_LOGI(TAG, "Fast recovery: Internet verified on new IP lease! Switching to Cloud Phase 1...");
             current_route_state = ROUTE_CLOUD; cloud_disconnect_count = 0; configure_mqtt_client();
         } else if (mqtt_client == NULL) {
             current_route_state = ROUTE_CLOUD; configure_mqtt_client();
@@ -1347,11 +1263,9 @@ void app_main(void) {
     init_dynamic_identity();
     init_system_leds(); 
 
-    // 1. Initialize TCP/IP and events
     esp_netif_init();
     esp_event_loop_create_default();
 
-    // 2. Configure the Physical Setup Switch (GPIO 32, with Pull-Up Enabled)
     gpio_config_t switch_cfg = {
         .pin_bit_mask = (1ULL << PROVISION_SWITCH_GPIO),
         .mode = GPIO_MODE_INPUT,
@@ -1362,23 +1276,13 @@ void app_main(void) {
     gpio_config(&switch_cfg);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    // 3. CAPTIVE PORTAL PROVISIONING MODE
     if (gpio_get_level(PROVISION_SWITCH_GPIO) == 0) {
-        ESP_LOGW(TAG, "===============================================");
-        ESP_LOGW(TAG, " CONFIG MODE TRIGGERED (SLIDE SWITCH GND)      ");
-        ESP_LOGW(TAG, " Broadcasting SoftAP Captive Portal...         ");
-        ESP_LOGW(TAG, "===============================================");
-        
         wifi_init_softap();
         xTaskCreate(dns_server_task, "dns_task", 3072, NULL, 5, NULL);
         start_captive_web_server();
-
         while(1) vTaskDelay(pdMS_TO_TICKS(1000)); 
     }
 
-    // 4. NORMAL RUN MODE (Switch is HIGH)
-    ESP_LOGI(TAG, "RUN MODE DETECTED. Loading NVS Configurations...");
-    
     nvs_handle_t h;
     if (nvs_open("senseable", NVS_READONLY, &h) == ESP_OK) {
         size_t len;
@@ -1392,14 +1296,7 @@ void app_main(void) {
         nvs_close(h);
     }
 
-    // ==============================================================
-    // 🛑 NEW SAFETY KILL-SWITCH (UNPROVISIONED NODE PROTECTION)
-    // ==============================================================
     if (strlen(tenant_id) == 0) {
-        ESP_LOGE(TAG, "FATAL: Board is unprovisioned (Missing Tenant ID).");
-        ESP_LOGE(TAG, "Halting execution. Please slide switch to GND and use Captive Portal.");
-        
-        // Rapidly blink the Fault LED to alert the human operator
         while (1) {
             gpio_set_level(SYSTEM_LED_FAULT, 1);
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -1407,7 +1304,6 @@ void app_main(void) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
-    // ==============================================================
     
     build_mqtt_topics();
 
@@ -1422,21 +1318,15 @@ void app_main(void) {
     if (i2c_master_init() == ESP_OK) {
         i2c_device_config_t ds_cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = DS3231_ADDR, .scl_speed_hz = I2C_MASTER_FREQ_HZ };
         i2c_master_bus_add_device(bus_handle, &ds_cfg, &ds3231_handle);
-        ESP_LOGI(TAG, "DS3231 RTC successfully mapped to master bus.");
-
         struct timeval tv = { .tv_sec = get_rtc_epoch(), .tv_usec = 0 };
         settimeofday(&tv, NULL);
-        ESP_LOGI(TAG, "ESP32 OS Time successfully synced with DS3231 hardware.");
-    } else {
-        ESP_LOGE(TAG, "Failed to initialize I2C master peripheral engine.");
-    }
+    } 
 
-    // DELAY ADDED HERE: Allow massive A7670C power surge and LLC to stabilize before scanning
     vTaskDelay(pdMS_TO_TICKS(2000));
     scan_i2c_bus();
 
-    // Spawning the new dedicated non-blocking LED indicator task
     xTaskCreate(network_led_task, "led_worker", 2048, NULL, 2, NULL);
+    xTaskCreate(eject_button_task, "eject_btn", 2048, NULL, 5, NULL); // Safe Eject slide switch
 
     xTaskCreate(ads_reader_task, "adc_worker", 3072, NULL, 5, NULL);
     xTaskCreate(telemetry_builder_task, "tlm_json", 4096, NULL, 5, NULL);
@@ -1444,10 +1334,8 @@ void app_main(void) {
     xTaskCreate(backlog_replay_task, "fifo_replay", 4096, NULL, 4, NULL);
 
     if (current_hw_mode == HW_MODE_CELLULAR) {
-        ESP_LOGI(TAG, ">>> BOOTING CELLULAR MODEM (A7670C) <<<");
         xTaskCreate(cellular_task, "cellular", 6144, NULL, 5, NULL);
     } else {
-        ESP_LOGI(TAG, ">>> BOOTING WI-FI STATION <<<");
         wifi_init_sta(); 
         xTaskCreate(cloud_watchdog_task, "cloud_wdog", 2048, NULL, 3, NULL); 
     }
