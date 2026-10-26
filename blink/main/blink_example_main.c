@@ -84,6 +84,7 @@ static const char *TAG = "THESIS_NODE";
 #define SYSTEM_LED_NET            14
 #define SYSTEM_LED_FAULT          23
 #define EJECT_BUTTON_GPIO         34   // Safe Eject slide switch (input-only; external 10k pull-up)
+#define EJECT_DEBOUNCE_MS         300  // switch must hold a new position this long to count
 #define PROVISION_SWITCH_GPIO     32   // Captive-portal provisioning switch
 
 // ==========================================
@@ -220,6 +221,21 @@ char tenant_id[32] = DEFAULT_TENANT_ID;
 #define I2C_MASTER_SCL_IO   22
 #define TCA4307_EN_GPIO     15   // LLC-boosted hardware gate (harmless if the TCA4307 is bypassed)
 #define I2C_MASTER_FREQ_HZ  100000
+// Per-transfer timeout. A flash erase (LittleFS spooling) can stall the CPU for
+// tens to hundreds of ms; 100 ms was short enough for that stall to abort an
+// in-progress transfer. A healthy transfer still completes in under 1 ms, and
+// an absent device still NACKs immediately, so this only matters when stalled.
+#define I2C_XFER_TIMEOUT_MS 500
+
+// Same purpose, but fixes the cause: lets the I2C interrupt keep running while
+// flash is being written. Enable in menuconfig (I2C driver options, "ISR
+// IRAM-safe"); the option name can differ between ESP-IDF versions.
+// (Reported at boot as a log line; a compile-time #warning breaks -Werror builds.)
+#if defined(CONFIG_I2C_ISR_IRAM_SAFE) && CONFIG_I2C_ISR_IRAM_SAFE
+#define I2C_IRAM_SAFE_ENABLED 1
+#else
+#define I2C_IRAM_SAFE_ENABLED 0
+#endif
 #define DS3231_ADDR         0x68
 #define DS3231_REG_TIME     0x00
 #define DS3231_REG_STATUS   0x0F
@@ -382,7 +398,7 @@ static time_t ds3231_read_epoch(bool *osf_set) {
 
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         if (ds3231_handle != NULL &&
-            i2c_master_transmit_receive(ds3231_handle, &reg, 1, data, sizeof(data), 100) == ESP_OK) {
+            i2c_master_transmit_receive(ds3231_handle, &reg, 1, data, sizeof(data), I2C_XFER_TIMEOUT_MS) == ESP_OK) {
             struct tm t = {0};
             t.tm_sec  = bcd2dec(data[0] & 0x7F);
             t.tm_min  = bcd2dec(data[1] & 0x7F);
@@ -395,7 +411,7 @@ static time_t ds3231_read_epoch(bool *osf_set) {
         }
         if (osf_set && ds3231_handle != NULL) {
             uint8_t sreg = DS3231_REG_STATUS, status = 0;
-            if (i2c_master_transmit_receive(ds3231_handle, &sreg, 1, &status, 1, 100) == ESP_OK) {
+            if (i2c_master_transmit_receive(ds3231_handle, &sreg, 1, &status, 1, I2C_XFER_TIMEOUT_MS) == ESP_OK) {
                 *osf_set = (status & DS3231_STATUS_OSF) != 0;
             }
         }
@@ -425,14 +441,14 @@ static bool ds3231_write_epoch(time_t now) {
     bool ok = false;
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         if (ds3231_handle != NULL &&
-            i2c_master_transmit(ds3231_handle, buf, sizeof(buf), 100) == ESP_OK) {
+            i2c_master_transmit(ds3231_handle, buf, sizeof(buf), I2C_XFER_TIMEOUT_MS) == ESP_OK) {
             ok = true;
             // Clear the Oscillator Stop Flag: the time is now known-good.
             uint8_t sreg = DS3231_REG_STATUS, status = 0;
-            if (i2c_master_transmit_receive(ds3231_handle, &sreg, 1, &status, 1, 100) == ESP_OK &&
+            if (i2c_master_transmit_receive(ds3231_handle, &sreg, 1, &status, 1, I2C_XFER_TIMEOUT_MS) == ESP_OK &&
                 (status & DS3231_STATUS_OSF)) {
                 uint8_t clr[2] = { DS3231_REG_STATUS, (uint8_t)(status & ~DS3231_STATUS_OSF) };
-                i2c_master_transmit(ds3231_handle, clr, sizeof(clr), 100);
+                i2c_master_transmit(ds3231_handle, clr, sizeof(clr), I2C_XFER_TIMEOUT_MS);
             }
         }
         xSemaphoreGive(i2c_mutex);
@@ -802,14 +818,14 @@ static int perform_i2c_probe_pass(bool *rtc_ok) {
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(200)) != pdTRUE) return -1;
 
     int found = 0;
-    if (bus_handle != NULL && i2c_master_probe(bus_handle, DS3231_ADDR, 100) == ESP_OK) {
+    if (bus_handle != NULL && i2c_master_probe(bus_handle, DS3231_ADDR, I2C_XFER_TIMEOUT_MS) == ESP_OK) {
         *rtc_ok = true;
     }
 
     if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
         for (int i = 0; i < 4; i++) {
             if (bus_handle == NULL) break;
-            if (i2c_master_probe(bus_handle, possible_addresses[i], 100) == ESP_OK) {
+            if (i2c_master_probe(bus_handle, possible_addresses[i], I2C_XFER_TIMEOUT_MS) == ESP_OK) {
                 if (ads_handles[i] == NULL) {
                     i2c_device_config_t dev_cfg = {
                         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -915,18 +931,23 @@ void eject_button_task(void *pvParameter) {
     int last_level = gpio_get_level(EJECT_BUTTON_GPIO);
     if (last_level == 0) apply_safe_eject(true);
 
+    // A change is accepted only after the pin has read the new level on every
+    // 10 ms sample for EJECT_DEBOUNCE_MS. A real flip of the switch easily
+    // passes; the ~100-250 ms glitches seen on GPIO 34 do not.
+    uint32_t stable_ms = 0;
     while (1) {
         int level = gpio_get_level(EJECT_BUTTON_GPIO);
         if (level != last_level) {
-            vTaskDelay(pdMS_TO_TICKS(50));                 // mechanical debounce
-            int confirmed = gpio_get_level(EJECT_BUTTON_GPIO);
-            if (confirmed == level) {                      // stable across the window
-                apply_safe_eject(confirmed == 0);
-                last_level = confirmed;
+            stable_ms += 10;
+            if (stable_ms >= EJECT_DEBOUNCE_MS) {
+                apply_safe_eject(level == 0);
+                last_level = level;
+                stable_ms = 0;
             }
-            // else: contact bounce -- ignore and re-evaluate on the next pass
+        } else {
+            stable_ms = 0;   // glitch ended before the window: ignore it
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -977,7 +998,7 @@ void ads_reader_task(void *pvParameter) {
                     break;
                 }
 
-                if (i2c_master_transmit(ads_handles[i], config_data, sizeof(config_data), 100) == ESP_OK) {
+                if (i2c_master_transmit(ads_handles[i], config_data, sizeof(config_data), I2C_XFER_TIMEOUT_MS) == ESP_OK) {
                     // Poll the OS bit (config bit 15: 0 = converting, 1 = done)
                     // instead of guessing a delay.
                     bool conv_done = false;
@@ -985,7 +1006,7 @@ void ads_reader_task(void *pvParameter) {
 
                     for (int tries = 0; tries < ADS_CONV_POLL_MAX_TRIES && !conv_done; tries++) {
                         vTaskDelay(pdMS_TO_TICKS(1));
-                        if (i2c_master_transmit_receive(ads_handles[i], &cfg_ptr, 1, buf, sizeof(buf), 100) == ESP_OK) {
+                        if (i2c_master_transmit_receive(ads_handles[i], &cfg_ptr, 1, buf, sizeof(buf), I2C_XFER_TIMEOUT_MS) == ESP_OK) {
                             conv_done = ((buf[0] & 0x80) != 0);
                         } else {
                             bus_error = true;
@@ -994,7 +1015,7 @@ void ads_reader_task(void *pvParameter) {
                     }
 
                     if (conv_done &&
-                        i2c_master_transmit_receive(ads_handles[i], &conv_ptr, 1, buf, sizeof(buf), 100) == ESP_OK) {
+                        i2c_master_transmit_receive(ads_handles[i], &conv_ptr, 1, buf, sizeof(buf), I2C_XFER_TIMEOUT_MS) == ESP_OK) {
                         final_val = (int16_t)((buf[0] << 8) | buf[1]);
                         consecutive_bus_errors = 0;
                     } else {
@@ -1928,7 +1949,11 @@ void backlog_replay_task(void *pvParameter) {
             if (f == NULL) {
                 replay_complete = false;
             } else {
-                ESP_LOGW(TAG, "Link restored. Replaying spooled telemetry...");
+                // Count rows first so progress can be shown as "n / total".
+                int total = 0;
+                while (fgets(line, sizeof(line), f) != NULL) if (line[0] != '\n' && line[0] != '\0') total++;
+                rewind(f);
+                ESP_LOGW(TAG, "Link restored. Replaying %d spooled rows (~%d s)...", total, (total * 150) / 1000 + 1);
                 int sent = 0, retimed = 0, undatable = 0, skipped = 0;
 
                 while (fgets(line, sizeof(line), f) != NULL) {
@@ -1981,6 +2006,7 @@ void backlog_replay_task(void *pvParameter) {
                     free(replay_payload);
                     if (msg_id < 0) { replay_complete = false; break; }
                     sent++;
+                    if (sent % 25 == 0) ESP_LOGI(TAG, "Replay progress: %d / %d rows sent", sent, total);
                     vTaskDelay(pdMS_TO_TICKS(150));
                 }
                 fclose(f);
@@ -2061,10 +2087,15 @@ void app_main(void) {
     // The i2c driver logs 2 warnings + 2 errors per failed transaction; at
     // 115200 baud that buries all THESIS_NODE output. Our own recovery
     // warnings carry the same information in one line.
-    //esp_log_level_set("i2c.master", ESP_LOG_NONE);
-    //esp_log_level_set("i2c.common", ESP_LOG_NONE);
+    esp_log_level_set("i2c.master", ESP_LOG_NONE);
+    esp_log_level_set("i2c.common", ESP_LOG_NONE);
 
     ESP_LOGI(TAG, "FreeRTOS tick rate: %d Hz", (int)configTICK_RATE_HZ);
+    if (I2C_IRAM_SAFE_ENABLED) {
+        ESP_LOGI(TAG, "I2C ISR IRAM-safe: enabled");
+    } else {
+        ESP_LOGW(TAG, "I2C ISR IRAM-safe: NOT enabled (flash writes may time out I2C; 500 ms timeouts still cover it)");
+    }
 
     // All timestamps are UTC end to end: DS3231 registers, mktime/gmtime, payloads.
     setenv("TZ", "UTC0", 1);
