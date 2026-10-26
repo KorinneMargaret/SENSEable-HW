@@ -139,11 +139,17 @@ static const uint8_t ADS_MUX_MSB[4] = { 0xC1, 0xD1, 0xE1, 0xF1 };
 
 // --- Zero-chip recovery back-off ---
 #define MAX_ZERO_CHIP_RECOVERIES    3
+// A chip is declared gone only after this many consecutive failed probes, so a
+// single NACK on a marginal bus no longer drops it (and its handle) for a scan.
+#define PROBE_MISS_LIMIT            3
+// When the bus itself is faulted (SDA/SCL held, RTC silent), recovery retries
+// back off 10 s -> 20 s -> 40 s -> 80 s instead of hammering a dead bus forever.
+#define I2C_FAULT_BACKOFF_MAX_MS    80000
 
 // --- Command pipeline ---
 #define MAX_CMD_PAYLOAD_LEN       1024
 #define MAX_CID_LEN               64
-#define CMD_QUEUE_DEPTH           4
+#define CMD_QUEUE_DEPTH           16     // the web app can send a burst of 16 port commands at once
 #define CMD_DEDUP_HISTORY         8
 #define CMD_MAX_AGE_SEC           300    // reject commands issued more than 5 min ago
 
@@ -220,7 +226,7 @@ char tenant_id[32] = DEFAULT_TENANT_ID;
 #define I2C_MASTER_SDA_IO   21
 #define I2C_MASTER_SCL_IO   22
 #define TCA4307_EN_GPIO     15   // LLC-boosted hardware gate (harmless if the TCA4307 is bypassed)
-#define I2C_MASTER_FREQ_HZ  100000
+#define I2C_MASTER_FREQ_HZ  10000    // ponytail: 10 kHz diagnostic; set back to 100000 once the PCB bus is fixed
 // Per-transfer timeout. A flash erase (LittleFS spooling) can stall the CPU for
 // tens to hundreds of ms; 100 ms was short enough for that stall to abort an
 // in-progress transfer. A healthy transfer still completes in under 1 ms, and
@@ -388,17 +394,36 @@ static uint8_t dec2bcd(uint8_t v) { return (uint8_t)(((v / 10) << 4) | (v % 10))
 static time_t node_epoch(void) { return time(NULL); }
 
 // Returns 0 on failure. Optionally reports the Oscillator Stop Flag.
+// A read can "succeed" on a noisy bus and still return garbage (seen in the
+// field: year 2167). Reject anything that is not valid BCD or is out of range,
+// so a corrupted read can never set the system clock or stamp telemetry.
+static bool bcd_ok(uint8_t v, uint8_t mask, uint8_t lo, uint8_t hi) {
+    v &= mask;
+    if ((v & 0x0F) > 9 || (v >> 4) > 9) return false;
+    uint8_t d = bcd2dec(v);
+    return d >= lo && d <= hi;
+}
+static bool ds3231_fields_valid(const uint8_t *d) {
+    if (d[2] & 0x40) return false;                       // 12-hour mode is never written by this firmware
+    if (d[5] & 0x80) return false;                       // century bit: this firmware only writes 20xx (caught the 2167 reads)
+    // ponytail: year capped at 2035 (a corrupt read gave 2046); raise the 35 if still deployed then
+    return bcd_ok(d[0], 0x7F, 0, 59) && bcd_ok(d[1], 0x7F, 0, 59) && bcd_ok(d[2], 0x3F, 0, 23) &&
+           bcd_ok(d[3], 0x07, 1, 7)  && bcd_ok(d[4], 0x3F, 1, 31) && bcd_ok(d[5], 0x1F, 1, 12) &&
+           bcd_ok(d[6], 0xFF, 24, 35);
+}
+
 static time_t ds3231_read_epoch(bool *osf_set) {
     if (osf_set) *osf_set = false;
     if (ds3231_handle == NULL) return 0;
 
     uint8_t reg = DS3231_REG_TIME;
-    uint8_t data[7];
+    uint8_t data[7] = {0};
     time_t epoch = 0;
 
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         if (ds3231_handle != NULL &&
-            i2c_master_transmit_receive(ds3231_handle, &reg, 1, data, sizeof(data), I2C_XFER_TIMEOUT_MS) == ESP_OK) {
+            i2c_master_transmit_receive(ds3231_handle, &reg, 1, data, sizeof(data), I2C_XFER_TIMEOUT_MS) == ESP_OK &&
+            ds3231_fields_valid(data)) {
             struct tm t = {0};
             t.tm_sec  = bcd2dec(data[0] & 0x7F);
             t.tm_min  = bcd2dec(data[1] & 0x7F);
@@ -460,7 +485,7 @@ static void seed_system_time_from_ds3231(bool at_boot) {
     bool osf = false;
     time_t rtc = ds3231_read_epoch(&osf);
     if (rtc <= 0) {
-        ESP_LOGE(TAG, "DS3231 read failed; system clock not seeded.");
+        ESP_LOGE(TAG, "DS3231 read failed or returned an invalid time; system clock not seeded.");
         return;
     }
     struct timeval tv = { .tv_sec = rtc, .tv_usec = 0 };
@@ -737,6 +762,37 @@ static esp_err_t i2c_master_init(void) {
     return i2c_new_master_bus(&i2c_mst_config, &bus_handle);
 }
 
+// Releases a slave left holding SDA low -- e.g. a battery-backed DS3231 that was
+// mid-read when the ESP32 reset, or a transfer aborted by a timeout: 9 clocks +
+// STOP, open-drain, ~100 kHz. The I2C driver must not own the pins while it runs.
+static void i2c_bus_clear(void) {
+    // Latch the outputs HIGH before enabling them, so enabling open-drain mode
+    // cannot pull SDA/SCL low for a moment (a spurious START on the bus).
+    gpio_set_level(I2C_MASTER_SDA_IO, 1);
+    gpio_set_level(I2C_MASTER_SCL_IO, 1);
+    gpio_config_t bb_cfg = {
+        .pin_bit_mask = (1ULL << I2C_MASTER_SDA_IO) | (1ULL << I2C_MASTER_SCL_IO),
+        .mode = GPIO_MODE_INPUT_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&bb_cfg);
+    esp_rom_delay_us(5);
+    for (int i = 0; i < 9; i++) {
+        gpio_set_level(I2C_MASTER_SCL_IO, 0); esp_rom_delay_us(5);
+        gpio_set_level(I2C_MASTER_SCL_IO, 1); esp_rom_delay_us(5);
+    }
+    // STOP: SDA rises while SCL is high
+    gpio_set_level(I2C_MASTER_SCL_IO, 0); esp_rom_delay_us(5);
+    gpio_set_level(I2C_MASTER_SDA_IO, 0); esp_rom_delay_us(5);
+    gpio_set_level(I2C_MASTER_SCL_IO, 1); esp_rom_delay_us(5);
+    gpio_set_level(I2C_MASTER_SDA_IO, 1); esp_rom_delay_us(5);
+
+    gpio_reset_pin(I2C_MASTER_SDA_IO);
+    gpio_reset_pin(I2C_MASTER_SCL_IO);
+}
+
 static void recover_i2c_bus(void) {
     // Never reset the bus or touch the gate while a pod may be mid-swap.
     if (safe_eject_active) {
@@ -765,31 +821,8 @@ static void recover_i2c_bus(void) {
         gpio_set_level(TCA4307_EN_GPIO, 1);
         vTaskDelay(pdMS_TO_TICKS(25));
 
-        // 3. Bit-bang 9 clocks + STOP at ~100 kHz to release any slave holding SDA
-        gpio_config_t bb_cfg = {
-            .pin_bit_mask = (1ULL << I2C_MASTER_SDA_IO) | (1ULL << I2C_MASTER_SCL_IO),
-            .mode = GPIO_MODE_INPUT_OUTPUT_OD,
-            .pull_up_en = GPIO_PULLUP_ENABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE
-        };
-        gpio_config(&bb_cfg);
-
-        gpio_set_level(I2C_MASTER_SDA_IO, 1);
-        gpio_set_level(I2C_MASTER_SCL_IO, 1);
-        esp_rom_delay_us(5);
-        for (int i = 0; i < 9; i++) {
-            gpio_set_level(I2C_MASTER_SCL_IO, 0); esp_rom_delay_us(5);
-            gpio_set_level(I2C_MASTER_SCL_IO, 1); esp_rom_delay_us(5);
-        }
-        // STOP: SDA rises while SCL is high
-        gpio_set_level(I2C_MASTER_SCL_IO, 0); esp_rom_delay_us(5);
-        gpio_set_level(I2C_MASTER_SDA_IO, 0); esp_rom_delay_us(5);
-        gpio_set_level(I2C_MASTER_SCL_IO, 1); esp_rom_delay_us(5);
-        gpio_set_level(I2C_MASTER_SDA_IO, 1); esp_rom_delay_us(5);
-
-        gpio_reset_pin(I2C_MASTER_SDA_IO);
-        gpio_reset_pin(I2C_MASTER_SCL_IO);
+        // 3. Release any slave holding SDA low
+        i2c_bus_clear();
 
         // 4. Re-initialise the master and restore the RTC
         if (i2c_master_init() == ESP_OK) {
@@ -810,82 +843,128 @@ static void recover_i2c_bus(void) {
 // ==========================================
 // NON-DESTRUCTIVE I2C SCANNING
 // ==========================================
-// Returns the number of ADS1115s found, or -1 if the bus could not be acquired.
-// -1 must NOT be treated as "zero chips": a busy bus is not an empty bus, and
-// misreading contention as absence would trigger a pointless recovery.
+// Returns the number of ADS1115s present, -1 if the bus mutex was busy, or -2 if
+// the bus itself is faulted. -1 must NOT be treated as "zero chips": a busy bus
+// is not an empty bus. -2 is detected from the RTC probe: a TIMEOUT (as opposed
+// to a NACK) means SDA/SCL are being held, so every other probe would also burn
+// the full timeout -- skip them and count the pass as a miss for every chip.
+static uint8_t probe_misses[4] = {0};
+
+// i2c_master_probe() always runs at a hard-coded 100 kHz, ignoring I2C_MASTER_FREQ_HZ.
+// This probe uses a throwaway device at our bus speed and reads one register.
+// ESP_ERR_TIMEOUT here means SDA or SCL is still physically low after the failure.
+static esp_err_t probe_addr(uint16_t addr) {
+    i2c_master_dev_handle_t h = NULL;
+    i2c_device_config_t cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = addr,
+        .scl_speed_hz    = I2C_MASTER_FREQ_HZ
+    };
+    if (i2c_master_bus_add_device(bus_handle, &cfg, &h) != ESP_OK) return ESP_FAIL;
+    uint8_t reg = (addr == DS3231_ADDR) ? DS3231_REG_STATUS : 0x01, b = 0;   // ADS1115: config register
+    esp_err_t e = i2c_master_transmit_receive(h, &reg, 1, &b, 1, I2C_XFER_TIMEOUT_MS);
+    i2c_master_bus_rm_device(h);
+    if (e != ESP_OK && (gpio_get_level(I2C_MASTER_SDA_IO) == 0 || gpio_get_level(I2C_MASTER_SCL_IO) == 0)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return e;
+}
+
 static int perform_i2c_probe_pass(bool *rtc_ok) {
     *rtc_ok = false;
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(200)) != pdTRUE) return -1;
 
-    int found = 0;
-    if (bus_handle != NULL && i2c_master_probe(bus_handle, DS3231_ADDR, I2C_XFER_TIMEOUT_MS) == ESP_OK) {
-        *rtc_ok = true;
+    bool bus_fault = (bus_handle == NULL);
+    if (!bus_fault) {
+        esp_err_t rtc_err = probe_addr(DS3231_ADDR);
+        *rtc_ok = (rtc_err == ESP_OK);
+        bus_fault = (rtc_err == ESP_ERR_TIMEOUT);
     }
 
+    bool online[4];
+    int found = 0;
+    for (int i = 0; i < 4; i++) {
+        bool ack = !bus_fault &&
+                   probe_addr(possible_addresses[i]) == ESP_OK;
+        if (ack) probe_misses[i] = 0;
+        else if (probe_misses[i] < PROBE_MISS_LIMIT) probe_misses[i]++;
+
+        // A chip that is already online survives isolated misses; it is dropped
+        // only after PROBE_MISS_LIMIT consecutive misses.
+        online[i] = ack || (ads_handles[i] != NULL && probe_misses[i] < PROBE_MISS_LIMIT);
+
+        if (online[i] && ads_handles[i] == NULL && !bus_fault) {
+            i2c_device_config_t dev_cfg = {
+                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+                .device_address = possible_addresses[i],
+                .scl_speed_hz = I2C_MASTER_FREQ_HZ
+            };
+            if (i2c_master_bus_add_device(bus_handle, &dev_cfg, &ads_handles[i]) != ESP_OK) {
+                ads_handles[i] = NULL;
+                online[i] = false;
+            }
+        } else if (!online[i] && ads_handles[i] != NULL) {
+            i2c_master_bus_rm_device(ads_handles[i]);
+            ads_handles[i] = NULL;
+        }
+        if (online[i]) found++;
+    }
+    xSemaphoreGive(i2c_mutex);
+
+    // Bookkeeping only: data_mutex is no longer held across I2C probes, so
+    // telemetry is never blocked behind a slow or faulted bus.
     if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
         for (int i = 0; i < 4; i++) {
-            if (bus_handle == NULL) break;
-            if (i2c_master_probe(bus_handle, possible_addresses[i], I2C_XFER_TIMEOUT_MS) == ESP_OK) {
-                if (ads_handles[i] == NULL) {
-                    i2c_device_config_t dev_cfg = {
-                        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-                        .device_address = possible_addresses[i],
-                        .scl_speed_hz = I2C_MASTER_FREQ_HZ
-                    };
-                    i2c_master_bus_add_device(bus_handle, &dev_cfg, &ads_handles[i]);
-                }
-                global_node_data[i].address = possible_addresses[i];
-                global_node_data[i].is_online = true;
-                found++;
-            } else {
-                if (ads_handles[i] != NULL) {
-                    i2c_master_bus_rm_device(ads_handles[i]);
-                    ads_handles[i] = NULL;
-                }
-                global_node_data[i].address = possible_addresses[i];
-                global_node_data[i].is_online = false;
-                memset(global_node_data[i].port_values, 0, sizeof(global_node_data[i].port_values));
-            }
+            global_node_data[i].address = possible_addresses[i];
+            global_node_data[i].is_online = online[i];
+            if (!online[i]) memset(global_node_data[i].port_values, 0, sizeof(global_node_data[i].port_values));
         }
         num_ads_found = (uint8_t)found;
-
         if (!safe_eject_active) {
             gpio_set_level(SYSTEM_LED_FAULT, (num_ads_found == 0) ? 1 : 0);
         }
         xSemaphoreGive(data_mutex);
     }
-    xSemaphoreGive(i2c_mutex);
-    return found;
+    return bus_fault ? -2 : found;
 }
 
 static void scan_i2c_bus(void) {
     if (safe_eject_active) return;
 
     static uint8_t zero_chip_recovery_attempts = 0;
+    static uint32_t fault_cooldown_ms = I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS;
 
     bool rtc_ok = false;
     int found = perform_i2c_probe_pass(&rtc_ok);
 
-    if (found < 0) return;                     // bus busy; try again next cycle
+    if (found == -1) return;                            // bus busy; try again next cycle
+    if (found > 0 || rtc_ok) fault_cooldown_ms = I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS;  // bus works
     if (found > 0) { zero_chip_recovery_attempts = 0; return; }
 
-    TickType_t now = xTaskGetTickCount();
-    bool cooldown_expired =
-        ((now - last_zero_chip_recovery_tick) >= pdMS_TO_TICKS(I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS));
-    if (!cooldown_expired) return;
+    // Zero chips. Either the bus is healthy and simply has no pods (RTC answers),
+    // or the bus is faulted (probe timed out, or the RTC is silent too).
+    bool bus_fault = (found == -2) || !rtc_ok;
 
-    // RTC_Alive=1 with zero chips means the master bus is healthy and there are
-    // simply no sensor pods attached -- a normal state for a modular node. The
-    // gate can latch disconnected while the upstream RTC still answers, so give
-    // recovery a few attempts, then stop. The probe pass above still runs every
-    // scan, so a pod plugged in later is discovered and resets the counter.
-    if (rtc_ok && zero_chip_recovery_attempts >= MAX_ZERO_CHIP_RECOVERIES) return;
+    TickType_t now = xTaskGetTickCount();
+    uint32_t cooldown_ms = bus_fault ? fault_cooldown_ms : I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS;
+    if ((now - last_zero_chip_recovery_tick) < pdMS_TO_TICKS(cooldown_ms)) return;
+
+    // Healthy bus, no pods: a few attempts (the gate can latch), then stop.
+    // perform_i2c_probe_pass() still runs every scan, so a pod plugged in later
+    // is discovered and resets the counter.
+    if (!bus_fault && zero_chip_recovery_attempts >= MAX_ZERO_CHIP_RECOVERIES) return;
 
     last_zero_chip_recovery_tick = now;
-    if (rtc_ok) zero_chip_recovery_attempts++;
-
-    ESP_LOGW(TAG, "0 ADS chips detected (RTC_Alive=%d, attempt %d/%d). Triggering rate-limited I2C recovery...",
-             rtc_ok, zero_chip_recovery_attempts, MAX_ZERO_CHIP_RECOVERIES);
+    if (bus_fault) {
+        ESP_LOGW(TAG, "I2C bus fault (%s). Recovery now; next attempt in %lu s if it persists.",
+                 found == -2 ? "SDA/SCL held: probe timed out" : "RTC not answering",
+                 (unsigned long)((fault_cooldown_ms < I2C_FAULT_BACKOFF_MAX_MS ? fault_cooldown_ms * 2 : fault_cooldown_ms) / 1000));
+        if (fault_cooldown_ms < I2C_FAULT_BACKOFF_MAX_MS) fault_cooldown_ms *= 2;
+    } else {
+        zero_chip_recovery_attempts++;
+        ESP_LOGW(TAG, "0 ADS chips detected (RTC_Alive=1, attempt %d/%d). Triggering rate-limited I2C recovery...",
+                 zero_chip_recovery_attempts, MAX_ZERO_CHIP_RECOVERIES);
+    }
 
     recover_i2c_bus();
     vTaskDelay(pdMS_TO_TICKS(150));
@@ -1697,7 +1776,10 @@ void telemetry_builder_task(void *pvParameter) {
             xSemaphoreGive(data_mutex);
         }
 
-        if (is_mqtt_connected && mqtt_client != NULL) {
+        // Until the clock is valid, spool instead of publishing live: a live row
+        // stamped with time-since-boot is dropped by the backend, while a spooled
+        // row records its uptime and is re-timed by the replay once SNTP syncs.
+        if (is_mqtt_connected && mqtt_client != NULL && node_epoch() >= MIN_VALID_EPOCH) {
             char *payload_string = cJSON_PrintUnformatted(root);
             if (payload_string != NULL) {
                 // enqueue, not publish: publish() with QoS 1 blocks the calling
@@ -2200,6 +2282,11 @@ void app_main(void) {
     if (command_queue == NULL) ESP_LOGE(TAG, "Failed to allocate command queue; C2 unavailable.");
 
     init_actuators();
+
+    // A battery-backed DS3231 keeps its I2C state across an ESP32 reset. If the
+    // reset landed mid-read, it is still holding SDA low: free it before the
+    // first transaction, or the boot-time clock seed fails.
+    i2c_bus_clear();
 
     if (i2c_master_init() == ESP_OK) {
         i2c_device_config_t ds_cfg = {
