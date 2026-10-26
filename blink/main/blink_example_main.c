@@ -40,6 +40,8 @@
 #include "esp_system.h"
 #include "esp_mac.h"
 #include "esp_rom_sys.h"
+#include "esp_random.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -121,6 +123,7 @@ static const char *TAG = "THESIS_NODE";
 #define SPOOL_FILE_PATH           "/fs/telemetry_spool.jsonl"
 #define SPOOL_REPLAY_PATH         SPOOL_FILE_PATH ".replaying"
 #define SPOOL_MAX_BYTES           1000000
+#define REPLAY_WAIT_FOR_TIME_MS   90000   // hold replay up to 90 s for SNTP so pre-sync rows can be re-timed
 
 // --- ADS1115 acquisition ---
 // PGA = 000 -> FSR +/-6.144 V, 1 LSB = 187.5 uV, ~26,670 counts across 0-5 V.
@@ -141,6 +144,7 @@ static const uint8_t ADS_MUX_MSB[4] = { 0xC1, 0xD1, 0xE1, 0xF1 };
 #define MAX_CID_LEN               64
 #define CMD_QUEUE_DEPTH           4
 #define CMD_DEDUP_HISTORY         8
+#define CMD_MAX_AGE_SEC           300    // reject commands issued more than 5 min ago
 
 // ==========================================
 // DYNAMIC TOPIC & ID BUFFERS
@@ -277,6 +281,19 @@ static cmd_msg_t cmd_staging;
 // ==========================================
 static volatile bool sntp_sync_pending = false;
 
+// Distinguishes this boot from earlier ones, so a spooled row's uptime can only
+// be converted back to wall-clock time within the boot that recorded it.
+static uint32_t boot_id = 0;
+
+// ==========================================
+// TENANT HANDOVER GLOBALS
+// ==========================================
+// Set at boot when the provisioned tenant differs from the one this node last
+// completed a connection under (NVS key "last_tid"), or when no history exists.
+static char previous_tenant_id[32] = "";   // empty when there is no old tenant to close out
+static volatile bool handover_pending = false;
+static bool broker_session_purge = false;   // connect with a clean session this boot
+
 // ==========================================
 // FORWARD DECLARATIONS
 // ==========================================
@@ -302,17 +319,16 @@ static void init_system_leds(void) {
     gpio_set_level(TCA4307_EN_GPIO, 1);   // gate ON by default
 }
 
+// Network LED: solid when MQTT is connected, 2 Hz blink when not.
+// Fault LED while safe eject is active: slow 1 Hz blink, so it can't be confused
+// with the solid "no ADS1115 detected" fault. Outside eject, the I2C scan owns it.
 void network_led_task(void *pvParameter) {
-    bool led_state = false;
+    uint32_t tick = 0;
     while (1) {
-        if (is_mqtt_connected) {
-            gpio_set_level(SYSTEM_LED_NET, 1);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        } else {
-            led_state = !led_state;
-            gpio_set_level(SYSTEM_LED_NET, led_state ? 1 : 0);
-            vTaskDelay(pdMS_TO_TICKS(250));
-        }
+        tick++;
+        gpio_set_level(SYSTEM_LED_NET, is_mqtt_connected ? 1 : (tick & 1));
+        if (safe_eject_active) gpio_set_level(SYSTEM_LED_FAULT, (tick >> 1) & 1);
+        vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
 
@@ -640,7 +656,25 @@ static void init_littlefs(void) {
     else ESP_LOGE(TAG, "LittleFS mount failed; offline buffering unavailable.");
 }
 
-static void spool_telemetry(const char *payload) {
+static double uptime_sec(void) {
+    return (double)esp_timer_get_time() / 1000000.0;
+}
+
+// Tenant IDs end up inside MQTT topic strings. Only allow the characters the
+// captive portal permits, so a corrupted spool row can never inject '/', '+'
+// or '#' and publish somewhere it shouldn't.
+static bool tenant_id_is_safe(const char *tid) {
+    if (tid == NULL) return false;
+    size_t n = strnlen(tid, 32);
+    if (n == 0 || n >= 32) return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = tid[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
+    }
+    return true;
+}
+
+static void spool_append_line(const char *payload) {
     struct stat st;
     if (stat(SPOOL_FILE_PATH, &st) == 0 && st.st_size > SPOOL_MAX_BYTES) {
         ESP_LOGE(TAG, "Spool reached %d bytes. Wiping backlog to protect flash.", SPOOL_MAX_BYTES);
@@ -653,6 +687,22 @@ static void spool_telemetry(const char *payload) {
         ESP_LOGW(TAG, "[OFFLINE] Buffered to LittleFS -> %s", payload);
     } else {
         ESP_LOGE(TAG, "Spool open failed (%s). Telemetry dropped.", SPOOL_FILE_PATH);
+    }
+}
+
+// Spools a telemetry object. The backend drops any late row whose timestamp is
+// before 2026 as "undatable", so if the clock is not yet valid the row also
+// records uptime ("_up") and this boot's ID ("_b"). The replay uses them to
+// re-time the row once SNTP has synced, then strips them before publishing.
+static void spool_telemetry_root(cJSON *root) {
+    if (node_epoch() < MIN_VALID_EPOCH) {
+        cJSON_AddNumberToObject(root, "_up", uptime_sec());
+        cJSON_AddNumberToObject(root, "_b", (double)boot_id);
+    }
+    char *s = cJSON_PrintUnformatted(root);
+    if (s != NULL) {
+        spool_append_line(s);
+        free(s);
     }
 }
 
@@ -835,8 +885,7 @@ static void apply_safe_eject(bool active) {
         // Gating mid-transaction would leave a slave holding SDA low.
         bool got_bus = (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(500)) == pdTRUE);
         safe_eject_active = true;
-        gpio_set_level(TCA4307_EN_GPIO, 0);
-        gpio_set_level(SYSTEM_LED_FAULT, 1);   // solid fault LED = safe to swap
+        gpio_set_level(TCA4307_EN_GPIO, 0);    // fault LED now slow-blinks (network_led_task)
         if (got_bus) xSemaphoreGive(i2c_mutex);
         ESP_LOGW(TAG, ">>> SAFE EJECT ACTIVATED: bus quiesced, gate locked (GPIO %d)%s <<<",
                  TCA4307_EN_GPIO, got_bus ? "" : " [bus was busy >500 ms]");
@@ -844,9 +893,9 @@ static void apply_safe_eject(bool active) {
         // Raise the gate and let it settle BEFORE clearing the flag, so no task
         // touches the bus during the gate's pre-charge.
         gpio_set_level(TCA4307_EN_GPIO, 1);
-        gpio_set_level(SYSTEM_LED_FAULT, 0);
         vTaskDelay(pdMS_TO_TICKS(150));
         safe_eject_active = false;
+        gpio_set_level(SYSTEM_LED_FAULT, 0);   // after the flag, so the blink can't leave it on; rescan sets the real state
         ESP_LOGI(TAG, ">>> SAFE EJECT DEACTIVATED: gate open, rescanning <<<");
         xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
     }
@@ -1043,7 +1092,42 @@ static void process_incoming_command(const char *json_string, size_t length) {
     }
     const char *action = act_item->valuestring;
 
-    // 3. Broker redelivery guard. The command DID execute on first receipt, so
+    // 3. Tenant / node binding. A command naming a different tenant or node is
+    //    never executed and never ACKed (an ACK would publish to OUR tenant's
+    //    topic about another tenant's command). Fields absent from the payload
+    //    are not required, but if present they must match.
+    cJSON *tid_item = cJSON_GetObjectItem(root, "tid");
+    cJSON *nid_item = cJSON_GetObjectItem(root, "nid");
+    if ((cJSON_IsString(tid_item) && tid_item->valuestring && strcmp(tid_item->valuestring, tenant_id) != 0) ||
+        (cJSON_IsString(nid_item) && nid_item->valuestring && strcmp(nid_item->valuestring, node_id) != 0)) {
+        ESP_LOGE(TAG, "Command [%s] rejected: addressed to tid=%s nid=%s, this node is %s / %s.",
+                 cid_buf,
+                 cJSON_IsString(tid_item) ? tid_item->valuestring : "-",
+                 cJSON_IsString(nid_item) ? nid_item->valuestring : "-",
+                 tenant_id, node_id);
+        cJSON_Delete(root);
+        return;
+    }
+
+    // 4. Staleness. A persistent broker session can deliver commands that were
+    //    queued hours ago. Only enforceable once the node's clock is valid; before
+    //    the first SNTP sync the age cannot be judged, so the command is allowed.
+    cJSON *ts_item = cJSON_GetObjectItem(root, "ts");
+    time_t now = node_epoch();
+    if (cJSON_IsNumber(ts_item) && now >= MIN_VALID_EPOCH) {
+        double age = difftime(now, (time_t)ts_item->valuedouble);
+        if (age > CMD_MAX_AGE_SEC) {
+            ESP_LOGW(TAG, "Command [%s] action [%s] expired: issued %.0f s ago (limit %d s). Not executing.",
+                     cid_buf, action, age, CMD_MAX_AGE_SEC);
+            char details[80];
+            snprintf(details, sizeof(details), "Command expired: issued %.0f s ago", age);
+            send_command_ack(cid_buf, action, "failed", details);
+            cJSON_Delete(root);
+            return;
+        }
+    }
+
+    // 5. Broker redelivery guard. The command DID execute on first receipt, so
     //    "completed" is accurate; the details field carries the distinction.
     if (cmd_already_seen(cid_buf)) {
         ESP_LOGW(TAG, "Duplicate command ID [%s] action [%s] -- broker redelivery, not re-executing.",
@@ -1300,6 +1384,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                      event->current_data_offset, event->data_len, event->total_data_len);
             return;
         }
+        // Only ever act on this node's own command topic. A persistent broker
+        // session can retain a subscription from a previous provisioning (a
+        // different tenant ID) and keep delivering that topic's messages.
+        if (event->topic_len != (int)strlen(topic_cmd) ||
+            strncmp(event->topic, topic_cmd, event->topic_len) != 0) {
+            ESP_LOGW(TAG, "Ignoring message on foreign topic [%.*s] (this node listens on %s). Stale broker session?",
+                     event->topic_len, event->topic, topic_cmd);
+            return;
+        }
+
         if (event->data_len <= 0 || event->data_len >= MAX_CMD_PAYLOAD_LEN) {
             ESP_LOGE(TAG, "Payload size (%d bytes) outside allowed limits. Dropping packet.", event->data_len);
             return;
@@ -1327,10 +1421,20 @@ static void configure_mqtt_client(void) {
     esp_mqtt_client_config_t mqtt_cfg = {0};
     mqtt_cfg.network.timeout_ms = MQTT_NETWORK_TIMEOUT_MS;
 
-    // Persistent session: the broker queues commands for this node across
-    // momentary drops. Duplicate redelivery is handled in the command worker.
-    mqtt_cfg.credentials.client_id         = node_id;
-    mqtt_cfg.session.disable_clean_session = true;
+    mqtt_cfg.credentials.client_id = node_id;
+
+    // Normally a persistent session: the broker queues commands for this node
+    // across momentary drops (stale and duplicate deliveries are handled in the
+    // command worker). In the boot where a tenant change is detected, connect
+    // with a CLEAN session instead, so the broker discards the old tenant's
+    // subscription and any commands it queued -- those must never execute on a
+    // node that now belongs to someone else. The clean session lasts for the
+    // rest of this boot; the next boot is persistent again.
+    mqtt_cfg.session.disable_clean_session = !broker_session_purge;
+    if (broker_session_purge) {
+        ESP_LOGW(TAG, "Tenant handover: connecting with a CLEAN session (broker discards stored state for %s).",
+                 node_id);
+    }
 
     mqtt_cfg.session.last_will.topic   = topic_status;
     mqtt_cfg.session.last_will.msg     = "{\"t\":\"lwt\",\"status\":\"offline\"}";
@@ -1572,23 +1676,23 @@ void telemetry_builder_task(void *pvParameter) {
             xSemaphoreGive(data_mutex);
         }
 
-        char *payload_string = cJSON_PrintUnformatted(root);
-        if (payload_string != NULL) {
-            if (is_mqtt_connected && mqtt_client != NULL) {
+        if (is_mqtt_connected && mqtt_client != NULL) {
+            char *payload_string = cJSON_PrintUnformatted(root);
+            if (payload_string != NULL) {
                 // enqueue, not publish: publish() with QoS 1 blocks the calling
                 // task until the write completes or times out, which froze data
                 // collection for two minutes on a dead socket.
                 if (esp_mqtt_client_enqueue(mqtt_client, topic_tlm, payload_string, 0, 1, 0, true) < 0) {
                     ESP_LOGW(TAG, "Telemetry enqueue failed; spooling instead.");
-                    spool_telemetry(payload_string);
+                    spool_telemetry_root(root);
                 } else {
                     ESP_LOGI(TAG, "Live Payload Dispatched -> %s", payload_string);
                 }
-            } else {
-                // Spool in BOTH modes: Wi-Fi can lose the cloud AND the edge broker at once.
-                spool_telemetry(payload_string);
+                free(payload_string);
             }
-            free(payload_string);
+        } else {
+            // Spool in BOTH modes: Wi-Fi can lose the cloud AND the edge broker at once.
+            spool_telemetry_root(root);
         }
         cJSON_Delete(root);
 
@@ -1729,19 +1833,77 @@ void discovery_builder_task(void *pvParameter) {
 }
 
 // ==========================================
+// TENANT HANDOVER
+// ==========================================
+// Called only once the offline backlog is fully delivered. Follows the order
+// agreed with the backend, on the PREVIOUS tenant's topics:
+//   1. backlog sent (already done by the caller)
+//   2. retained {"t":"lwt","status":"offline"}  -> A's dashboard shows Offline at once
+//   3. empty retained disco                     -> clears the stale retained copy
+//   4. empty retained config                    -> stops stale settings replaying into A
+// Then records the new tenant in NVS so later boots use a normal session.
+// Returns false (and is retried on the next replay cycle) if anything fails.
+static bool complete_tenant_handover(void) {
+    if (previous_tenant_id[0] != '\0') {
+        char old_status[128], old_disco[128], old_config[128];
+        snprintf(old_status, sizeof(old_status), "%s/%s/%s/status", MQTT_TOPIC_ROOT, previous_tenant_id, node_id);
+        snprintf(old_disco,  sizeof(old_disco),  "%s/%s/%s/disco",  MQTT_TOPIC_ROOT, previous_tenant_id, node_id);
+        snprintf(old_config, sizeof(old_config), "%s/%s/%s/config", MQTT_TOPIC_ROOT, previous_tenant_id, node_id);
+
+        if (esp_mqtt_client_publish(mqtt_client, old_status, "{\"t\":\"lwt\",\"status\":\"offline\"}", 0, 1, 1) < 0 ||
+            esp_mqtt_client_publish(mqtt_client, old_disco,  "", 0, 1, 1) < 0 ||
+            esp_mqtt_client_publish(mqtt_client, old_config, "", 0, 1, 1) < 0) {
+            ESP_LOGW(TAG, "Tenant handover: could not close out %s yet; will retry.", previous_tenant_id);
+            return false;
+        }
+        ESP_LOGW(TAG, "Tenant handover: %s closed out (status offline, retained disco and config cleared).",
+                 previous_tenant_id);
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("senseable", NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "last_tid", tenant_id);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Tenant handover: could not record %s in NVS (%s); will retry.",
+                 tenant_id, esp_err_to_name(err));
+        return false;
+    }
+
+    handover_pending = false;
+    ESP_LOGI(TAG, "Tenant handover complete. Node now belongs to %s.", tenant_id);
+    return true;
+}
+
+// ==========================================
 // OFFLINE BACKLOG REPLAY (both modes)
 // ==========================================
 // The live spool is renamed before replay so rows appended during the replay
 // are never deleted unread. A replay interrupted by a disconnect is resumed
 // (from the start of that file) on the next connection rather than discarded;
-// a few rows may therefore be sent twice -- every replayed row carries "r":1,
-// and the backend should de-duplicate on (nid, ts).
+// a few rows may therefore be sent twice -- every replayed row carries "r":1.
+//
+// Each row is published on the topic of the tenant recorded INSIDE that row, so
+// readings taken while the node belonged to tenant A go back to A even after it
+// has been moved to B, and never appear on B's topics. (The backend also routes
+// by the payload's tid, so this keeps the separation at the broker as well.)
+static bool spool_has_data(void) {
+    struct stat st;
+    return (stat(SPOOL_REPLAY_PATH, &st) == 0 && st.st_size > 0) ||
+           (stat(SPOOL_FILE_PATH, &st) == 0 && st.st_size > 0);
+}
+
 void backlog_replay_task(void *pvParameter) {
     static char line[1024];
+    char row_topic[128];
 
     while (1) {
         xEventGroupWaitBits(s_network_event_group, MQTT_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
+        bool replay_complete = true;
         struct stat st;
         bool have_replay = (stat(SPOOL_REPLAY_PATH, &st) == 0 && st.st_size > 0);
         if (!have_replay && stat(SPOOL_FILE_PATH, &st) == 0 && st.st_size > 0) {
@@ -1750,43 +1912,94 @@ void backlog_replay_task(void *pvParameter) {
         }
 
         if (have_replay) {
+            // Give SNTP a chance first: rows recorded before the clock was valid
+            // can only be re-timed once it is, and the backend drops them otherwise.
+            TickType_t wait_start = xTaskGetTickCount();
+            while (node_epoch() < MIN_VALID_EPOCH && is_mqtt_connected &&
+                   (xTaskGetTickCount() - wait_start) < pdMS_TO_TICKS(REPLAY_WAIT_FOR_TIME_MS)) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            if (node_epoch() < MIN_VALID_EPOCH) {
+                ESP_LOGW(TAG, "Clock still not valid after %d s; replaying anyway (pre-sync rows will be undatable).",
+                         REPLAY_WAIT_FOR_TIME_MS / 1000);
+            }
+
             FILE *f = fopen(SPOOL_REPLAY_PATH, "r");
-            if (f != NULL) {
+            if (f == NULL) {
+                replay_complete = false;
+            } else {
                 ESP_LOGW(TAG, "Link restored. Replaying spooled telemetry...");
-                int sent = 0;
-                bool complete = true;
+                int sent = 0, retimed = 0, undatable = 0, skipped = 0;
 
                 while (fgets(line, sizeof(line), f) != NULL) {
                     line[strcspn(line, "\r\n")] = '\0';
                     if (line[0] == '\0') continue;
-                    if (!is_mqtt_connected || mqtt_client == NULL) { complete = false; break; }
+                    if (!is_mqtt_connected || mqtt_client == NULL) { replay_complete = false; break; }
 
-                    cJSON *saved_json = cJSON_Parse(line);
-                    if (saved_json == NULL) continue;   // torn line from a power loss mid-write
-                    cJSON_AddNumberToObject(saved_json, "r", 1);
-                    char *replay_payload = cJSON_PrintUnformatted(saved_json);
-                    cJSON_Delete(saved_json);
-                    if (replay_payload == NULL) continue;
+                    cJSON *saved = cJSON_Parse(line);
+                    if (saved == NULL) { skipped++; continue; }   // torn line from a power loss mid-write
+
+                    // ---- Re-time rows recorded before the clock was valid
+                    cJSON *up_item  = cJSON_GetObjectItem(saved, "_up");
+                    cJSON *bid_item = cJSON_GetObjectItem(saved, "_b");
+                    if (cJSON_IsNumber(up_item)) {
+                        time_t now = node_epoch();
+                        if (now >= MIN_VALID_EPOCH && cJSON_IsNumber(bid_item) &&
+                            (uint32_t)bid_item->valuedouble == boot_id) {
+                            double age = uptime_sec() - up_item->valuedouble;
+                            if (age < 0) age = 0;
+                            cJSON_ReplaceItemInObject(saved, "ts", cJSON_CreateNumber((double)now - age));
+                            retimed++;
+                        } else {
+                            undatable++;   // recorded in an earlier boot: cannot be recovered
+                        }
+                        cJSON_DeleteItemFromObject(saved, "_up");
+                        cJSON_DeleteItemFromObject(saved, "_b");
+                    }
+
+                    // ---- Route by the tenant recorded in the row
+                    cJSON *tid_item = cJSON_GetObjectItem(saved, "tid");
+                    const char *row_tid = (cJSON_IsString(tid_item) && tid_item->valuestring)
+                                          ? tid_item->valuestring : tenant_id;
+                    if (!tenant_id_is_safe(row_tid)) {
+                        ESP_LOGW(TAG, "Skipping spooled row with invalid tid.");
+                        cJSON_Delete(saved);
+                        skipped++;
+                        continue;
+                    }
+                    snprintf(row_topic, sizeof(row_topic), "%s/%s/%s/tlm", MQTT_TOPIC_ROOT, row_tid, node_id);
+
+                    cJSON_AddNumberToObject(saved, "r", 1);
+                    char *replay_payload = cJSON_PrintUnformatted(saved);
+                    cJSON_Delete(saved);
+                    if (replay_payload == NULL) { skipped++; continue; }
 
                     // publish() (blocking) is deliberate here: this is a dedicated
                     // task, and pacing one-at-a-time keeps a large backlog out of
                     // the MQTT outbox's RAM.
-                    int msg_id = esp_mqtt_client_publish(mqtt_client, topic_tlm, replay_payload, 0, 1, 0);
+                    int msg_id = esp_mqtt_client_publish(mqtt_client, row_topic, replay_payload, 0, 1, 0);
                     free(replay_payload);
-                    if (msg_id < 0) { complete = false; break; }
+                    if (msg_id < 0) { replay_complete = false; break; }
                     sent++;
                     vTaskDelay(pdMS_TO_TICKS(150));
                 }
                 fclose(f);
 
-                if (complete) {
+                if (replay_complete) {
                     remove(SPOOL_REPLAY_PATH);
-                    ESP_LOGI(TAG, "Backlog replay complete (%d rows). Spool cleared.", sent);
+                    ESP_LOGI(TAG, "Backlog replay complete: %d rows sent (%d re-timed, %d undatable), %d skipped. Spool cleared.",
+                             sent, retimed, undatable, skipped);
                 } else {
                     ESP_LOGW(TAG, "Backlog replay interrupted after %d rows; will resume on reconnect.", sent);
                 }
             }
         }
+
+        // Close out the previous tenant only once its backlog has been delivered.
+        if (handover_pending && replay_complete && is_mqtt_connected && mqtt_client != NULL && !spool_has_data()) {
+            complete_tenant_handover();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
@@ -1848,8 +2061,8 @@ void app_main(void) {
     // The i2c driver logs 2 warnings + 2 errors per failed transaction; at
     // 115200 baud that buries all THESIS_NODE output. Our own recovery
     // warnings carry the same information in one line.
-    esp_log_level_set("i2c.master", ESP_LOG_NONE);
-    esp_log_level_set("i2c.common", ESP_LOG_NONE);
+    //esp_log_level_set("i2c.master", ESP_LOG_NONE);
+    //esp_log_level_set("i2c.common", ESP_LOG_NONE);
 
     ESP_LOGI(TAG, "FreeRTOS tick rate: %d Hz", (int)configTICK_RATE_HZ);
 
@@ -1911,6 +2124,38 @@ void app_main(void) {
             gpio_set_level(SYSTEM_LED_FAULT, 0); vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
+
+    // ---- Tenant history: detect re-provisioning to a different tenant ----
+    {
+        char last_tid[32] = "";
+        bool have_history = false;
+        nvs_handle_t th;
+        if (nvs_open("senseable", NVS_READONLY, &th) == ESP_OK) {
+            size_t len = sizeof(last_tid);
+            have_history = (nvs_get_str(th, "last_tid", last_tid, &len) == ESP_OK && last_tid[0] != '\0');
+            nvs_close(th);
+        }
+
+        if (!have_history) {
+            // First boot of this firmware (or freshly erased flash): the old
+            // tenant is unknown, so nothing can be closed out -- but the broker
+            // may still hold stale state for this client ID, so purge it once.
+            broker_session_purge = true;
+            handover_pending = true;
+            ESP_LOGW(TAG, "No tenant history stored. Broker session will be purged once, then %s recorded.", tenant_id);
+        } else if (strcmp(last_tid, tenant_id) != 0) {
+            if (tenant_id_is_safe(last_tid)) {
+                snprintf(previous_tenant_id, sizeof(previous_tenant_id), "%s", last_tid);
+            }
+            broker_session_purge = true;
+            handover_pending = true;
+            ESP_LOGW(TAG, "Tenant change detected: %s -> %s. Broker session will be purged; %s will be closed out after its backlog is sent.",
+                     last_tid, tenant_id, last_tid);
+        } else {
+            ESP_LOGI(TAG, "Tenant unchanged (%s). Using persistent broker session.", tenant_id);
+        }
+    }
+    boot_id = esp_random();
 
     build_mqtt_topics();
 
