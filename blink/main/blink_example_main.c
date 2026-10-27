@@ -21,6 +21,7 @@
  *   (menuconfig -> Component config -> FreeRTOS -> Kernel -> configTICK_RATE_HZ)
  */
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -97,7 +98,11 @@ static const char *TAG = "THESIS_NODE";
 #define HEALTH_LOG_EVERY_N_CYCLES           6      // one health line per minute
 
 // --- Cloud & MQTT Timers ---
-#define MQTT_NETWORK_TIMEOUT_MS             60000
+// How long a write to a dead link may block before the client gives up and
+// disconnects. 60 s let a dropped hotspot go unnoticed for over a minute (and
+// held the MQTT client lock the whole time); 20 s still covers a slow TLS
+// handshake over cellular.
+#define MQTT_NETWORK_TIMEOUT_MS             20000
 // Mobile/hotspot NAT commonly drops idle mappings well before 120 s; the
 // connection then dies silently and the next write hangs for the full network
 // timeout. 45 s keeps the mapping alive.
@@ -133,6 +138,10 @@ static const uint8_t ADS_MUX_MSB[4] = { 0xC1, 0xD1, 0xE1, 0xF1 };
 #define ADS_CONFIG_LSB              0x83   // 128 SPS, comparator disabled
 #define ADS_CONV_POLL_MAX_TRIES     25     // ms ceiling; 128 SPS needs ~7.8 ms
 #define ADS_SUSTAINED_ERROR_LIMIT   8
+// "Not read yet" (chip just appeared, or a port was just re-enabled). Never a real
+// single-ended reading. Such ports are left out of telemetry instead of being
+// sent as 0 V, which the backend would plot as a real dip to zero.
+#define ADS_NO_DATA                 INT16_MIN
 
 // --- Topology reporting ---
 #define PORT_DEBOUNCE_SAMPLES       3      // agreeing scans before a change is believed
@@ -252,6 +261,8 @@ char tenant_id[32] = DEFAULT_TENANT_ID;
 #define DS3231_REG_TIME     0x00
 #define DS3231_REG_STATUS   0x0F
 #define DS3231_STATUS_OSF   0x80   // Oscillator Stop Flag: set if the RTC ever lost power
+#define DS3231_REG_CONTROL  0x0E
+#define DS3231_CONTROL_EOSC 0x80   // 1 = oscillator stops while on battery
 #define REG_POINTER_CONVERT 0x00
 #define REG_POINTER_CONFIG  0x01
 
@@ -298,6 +309,19 @@ typedef struct {
 } cmd_msg_t;
 
 static QueueHandle_t command_queue = NULL;
+
+// Telemetry rows (heap strings) from the builder to the publisher. 4 rows = 40 s;
+// beyond that the builder spools to flash instead of waiting.
+#define TLM_OUT_QUEUE_DEPTH 4
+static QueueHandle_t tlm_out_queue = NULL;
+
+// The spool file now has two writers (builder and publisher) plus the replay's
+// rename; all three go through this lock.
+static SemaphoreHandle_t spool_mutex = NULL;
+
+// Serialises configure_mqtt_client(): the Wi-Fi event handler, the cloud
+// watchdog and the cellular task can all call it.
+static SemaphoreHandle_t mqtt_cfg_mutex = NULL;
 
 // Staging buffer for the MQTT event handler. Safe as a single static because
 // MQTT_EVENT_DATA is only ever dispatched from the MQTT task, and xQueueSend
@@ -481,6 +505,16 @@ static bool ds3231_write_epoch(time_t now) {
                 uint8_t clr[2] = { DS3231_REG_STATUS, (uint8_t)(status & ~DS3231_STATUS_OSF) };
                 i2c_master_transmit(ds3231_handle, clr, sizeof(clr), I2C_XFER_TIMEOUT_MS);
             }
+            // EOSC (control bit 7) set = oscillator stops whenever the RTC runs on
+            // its battery, i.e. time freezes while the board is unpowered. It is 0
+            // from the factory, but a corrupted write on the faulty bus can set it.
+            uint8_t creg = DS3231_REG_CONTROL, ctrl = 0;
+            if (i2c_master_transmit_receive(ds3231_handle, &creg, 1, &ctrl, 1, I2C_XFER_TIMEOUT_MS) == ESP_OK &&
+                (ctrl & DS3231_CONTROL_EOSC)) {
+                uint8_t fix[2] = { DS3231_REG_CONTROL, (uint8_t)(ctrl & ~DS3231_CONTROL_EOSC) };
+                i2c_master_transmit(ds3231_handle, fix, sizeof(fix), I2C_XFER_TIMEOUT_MS);
+                ESP_LOGW(TAG, "DS3231 oscillator was set to stop on battery (EOSC=1); cleared.");
+            }
         }
         xSemaphoreGive(i2c_mutex);
     }
@@ -502,8 +536,13 @@ static void seed_system_time_from_ds3231(bool at_boot) {
         struct tm t; gmtime_r(&rtc, &t);
         strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%SZ", &t);
         ESP_LOGI(TAG, "System clock seeded from DS3231: %s", iso);
-        if (osf || rtc < MIN_VALID_EPOCH) {
-            ESP_LOGW(TAG, "DS3231 time is not valid (OSF=%d). Timestamps will be wrong until the first SNTP sync.", osf);
+        // OSF = the oscillator stopped at some point, so the time is behind by
+        // however long it was stopped (seen in the field: 27 s after a power
+        // cycle). Still used: on the local edge with no internet there is no
+        // SNTP, and a slightly late timestamp beats an undatable row.
+        if (osf) {
+            ESP_LOGW(TAG, "DS3231 oscillator stopped since its last sync (OSF=1): time may be behind until SNTP. "
+                          "Check the RTC backup battery.");
         }
     }
 }
@@ -722,19 +761,22 @@ static bool tenant_id_is_safe(const char *tid) {
 }
 
 static void spool_append_line(const char *payload) {
+    xSemaphoreTake(spool_mutex, portMAX_DELAY);
     struct stat st;
     if (stat(SPOOL_FILE_PATH, &st) == 0 && st.st_size > SPOOL_MAX_BYTES) {
         ESP_LOGE(TAG, "Spool reached %d bytes. Wiping backlog to protect flash.", SPOOL_MAX_BYTES);
         remove(SPOOL_FILE_PATH);
     }
     FILE *f = fopen(SPOOL_FILE_PATH, "a");
+    bool ok = false;
     if (f != NULL) {
         fprintf(f, "%s\n", payload);
         fclose(f);
-        ESP_LOGW(TAG, "[OFFLINE] Buffered to LittleFS -> %s", payload);
-    } else {
-        ESP_LOGE(TAG, "Spool open failed (%s). Telemetry dropped.", SPOOL_FILE_PATH);
+        ok = true;
     }
+    xSemaphoreGive(spool_mutex);
+    if (ok) ESP_LOGW(TAG, "[OFFLINE] Buffered to LittleFS -> %s", payload);
+    else    ESP_LOGE(TAG, "Spool open failed (%s). Telemetry dropped.", SPOOL_FILE_PATH);
 }
 
 // Spools a telemetry object. The backend drops any late row whose timestamp is
@@ -926,8 +968,10 @@ static int perform_i2c_probe_pass(bool *rtc_ok) {
     if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
         for (int i = 0; i < 4; i++) {
             global_node_data[i].address = possible_addresses[i];
+            if (!online[i] || !global_node_data[i].is_online) {   // offline, or just came online
+                for (int ch = 0; ch < 4; ch++) global_node_data[i].port_values[ch] = ADS_NO_DATA;
+            }
             global_node_data[i].is_online = online[i];
-            if (!online[i]) memset(global_node_data[i].port_values, 0, sizeof(global_node_data[i].port_values));
         }
         num_ads_found = (uint8_t)found;
         if (!safe_eject_active) {
@@ -1415,6 +1459,9 @@ static void process_incoming_command(const char *json_string, size_t length) {
                 send_command_ack(cid_buf, action, "started", "Modifying software configuration states");
 
                 if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
+                    if (set_active && !port_active[chip_idx][ch_idx]) {
+                        global_node_data[chip_idx].port_values[ch_idx] = ADS_NO_DATA;   // value from before it was disabled is stale
+                    }
                     port_active[chip_idx][ch_idx] = set_active;
                     xSemaphoreGive(data_mutex);
                 }
@@ -1565,7 +1612,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 }
 
 static void configure_mqtt_client(void) {
-    if (mqtt_client != NULL) { esp_mqtt_client_stop(mqtt_client); esp_mqtt_client_destroy(mqtt_client); }
+    xSemaphoreTake(mqtt_cfg_mutex, portMAX_DELAY);
 
     esp_mqtt_client_config_t mqtt_cfg = {0};
     mqtt_cfg.network.timeout_ms = MQTT_NETWORK_TIMEOUT_MS;
@@ -1606,9 +1653,22 @@ static void configure_mqtt_client(void) {
             mqtt_cfg.credentials.authentication.password = LOCAL_MQTT_PASSWORD;
         }
     }
-    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    esp_mqtt_client_start(mqtt_client);
+    if (mqtt_client == NULL) {
+        esp_mqtt_client_handle_t c = esp_mqtt_client_init(&mqtt_cfg);
+        esp_mqtt_client_register_event(c, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+        mqtt_client = c;
+        esp_mqtt_client_start(c);
+    } else {
+        // Re-point the existing client instead of destroying it: other tasks hold
+        // the handle (a destroy under them is a use-after-free), and its outbox
+        // keeps QoS 1 rows that were queued but not yet acknowledged.
+        esp_mqtt_client_stop(mqtt_client);
+        is_mqtt_connected = false;   // stop() does not raise MQTT_EVENT_DISCONNECTED
+        xEventGroupClearBits(s_network_event_group, MQTT_CONNECTED_BIT);
+        esp_mqtt_set_config(mqtt_client, &mqtt_cfg);
+        esp_mqtt_client_start(mqtt_client);
+    }
+    xSemaphoreGive(mqtt_cfg_mutex);
 }
 
 // ==========================================
@@ -1788,6 +1848,27 @@ void cellular_task(void *pvParameter) {
 }
 
 // ==========================================
+// TELEMETRY PUBLISHER
+// ==========================================
+// Separate from the builder because esp_mqtt_client_enqueue() waits for the
+// MQTT client's internal lock, and the MQTT task holds that lock for the whole
+// network timeout while a write to a dead link stalls. In the field that froze
+// the builder for 112 s: those rows were neither sent nor spooled.
+void telemetry_publisher_task(void *pvParameter) {
+    char *s;
+    while (1) {
+        if (xQueueReceive(tlm_out_queue, &s, portMAX_DELAY) != pdTRUE) continue;
+        if (is_mqtt_connected && mqtt_client != NULL &&
+            esp_mqtt_client_enqueue(mqtt_client, topic_tlm, s, 0, 1, 0, true) >= 0) {
+            ESP_LOGI(TAG, "Live Payload Dispatched -> %s", s);
+        } else {
+            spool_append_line(s);   // only queued with a valid clock, so no re-time fields needed
+        }
+        free(s);
+    }
+}
+
+// ==========================================
 // TELEMETRY BUILDER
 // ==========================================
 void telemetry_builder_task(void *pvParameter) {
@@ -1814,7 +1895,7 @@ void telemetry_builder_task(void *pvParameter) {
 
                 cJSON *ports_array = cJSON_AddArrayToObject(chip_obj, "p");
                 for (int channel = 0; channel < 4; channel++) {
-                    if (port_active[i][channel]) {
+                    if (port_active[i][channel] && global_node_data[i].port_values[channel] != ADS_NO_DATA) {
                         int16_t raw_reading = global_node_data[i].port_values[channel];
                         int port_data[3] = { channel, raw_reading, evaluate_port_status(raw_reading) };
                         cJSON_AddItemToArray(ports_array, cJSON_CreateIntArray(port_data, 3));
@@ -1829,18 +1910,14 @@ void telemetry_builder_task(void *pvParameter) {
         // stamped with time-since-boot is dropped by the backend, while a spooled
         // row records its uptime and is re-timed by the replay once SNTP syncs.
         if (is_mqtt_connected && mqtt_client != NULL && node_epoch() >= MIN_VALID_EPOCH) {
+            // Hand the row to telemetry_publisher_task and never wait for it: if
+            // the publisher is stuck behind a stalled MQTT write, the row goes to
+            // flash instead of being lost.
             char *payload_string = cJSON_PrintUnformatted(root);
-            if (payload_string != NULL) {
-                // enqueue, not publish: publish() with QoS 1 blocks the calling
-                // task until the write completes or times out, which froze data
-                // collection for two minutes on a dead socket.
-                if (esp_mqtt_client_enqueue(mqtt_client, topic_tlm, payload_string, 0, 1, 0, true) < 0) {
-                    ESP_LOGW(TAG, "Telemetry enqueue failed; spooling instead.");
-                    spool_telemetry_root(root);
-                } else {
-                    ESP_LOGI(TAG, "Live Payload Dispatched -> %s", payload_string);
-                }
+            if (payload_string != NULL && xQueueSend(tlm_out_queue, &payload_string, 0) != pdTRUE) {
                 free(payload_string);
+                ESP_LOGW(TAG, "MQTT link stalled; spooling telemetry.");
+                spool_telemetry_root(root);
             }
         } else {
             // Spool in BOTH modes: Wi-Fi can lose the cloud AND the edge broker at once.
@@ -2071,9 +2148,13 @@ void backlog_replay_task(void *pvParameter) {
         bool replay_complete = true;
         struct stat st;
         bool have_replay = (stat(SPOOL_REPLAY_PATH, &st) == 0 && st.st_size > 0);
-        if (!have_replay && stat(SPOOL_FILE_PATH, &st) == 0 && st.st_size > 0) {
-            remove(SPOOL_REPLAY_PATH);   // clear any zero-length leftover
-            have_replay = (rename(SPOOL_FILE_PATH, SPOOL_REPLAY_PATH) == 0);
+        if (!have_replay) {
+            xSemaphoreTake(spool_mutex, portMAX_DELAY);   // no append may be mid-write during the rename
+            if (stat(SPOOL_FILE_PATH, &st) == 0 && st.st_size > 0) {
+                remove(SPOOL_REPLAY_PATH);   // clear any zero-length leftover
+                have_replay = (rename(SPOOL_FILE_PATH, SPOOL_REPLAY_PATH) == 0);
+            }
+            xSemaphoreGive(spool_mutex);
         }
 
         if (have_replay) {
@@ -2160,7 +2241,10 @@ void backlog_replay_task(void *pvParameter) {
                     ESP_LOGI(TAG, "Backlog replay complete: %d rows sent (%d re-timed, %d undatable), %d skipped. Spool cleared.",
                              sent, retimed, undatable, skipped);
                 } else {
-                    ESP_LOGW(TAG, "Backlog replay interrupted after %d rows; will resume on reconnect.", sent);
+                    // The whole file is replayed again on reconnect: rows already sent
+                    // over a link that was dying may never have arrived, so they are
+                    // re-sent (marked "r":1). The backend should de-duplicate on nid+ts.
+                    ESP_LOGW(TAG, "Backlog replay interrupted after %d rows; the full backlog is re-sent on reconnect.", sent);
                 }
             }
         }
@@ -2341,6 +2425,9 @@ void app_main(void) {
     s_hardware_event_group = xEventGroupCreate();
 
     command_queue = xQueueCreate(CMD_QUEUE_DEPTH, sizeof(cmd_msg_t));
+    tlm_out_queue = xQueueCreate(TLM_OUT_QUEUE_DEPTH, sizeof(char *));
+    spool_mutex    = xSemaphoreCreateMutex();
+    mqtt_cfg_mutex = xSemaphoreCreateMutex();
     if (command_queue == NULL) ESP_LOGE(TAG, "Failed to allocate command queue; C2 unavailable.");
 
     init_actuators();
@@ -2377,6 +2464,7 @@ void app_main(void) {
     xTaskCreate(eject_button_task,      "eject_btn",   3072, NULL, 5, NULL);
     xTaskCreate(ads_reader_task,        "adc_worker",  3072, NULL, 5, NULL);
     xTaskCreate(telemetry_builder_task, "tlm_json",    4096, NULL, 5, NULL);
+    xTaskCreate(telemetry_publisher_task, "tlm_pub",   3072, NULL, 5, NULL);
     xTaskCreate(discovery_builder_task, "disco_json",  4096, NULL, 4, NULL);
     xTaskCreate(backlog_replay_task,    "fifo_replay", 4096, NULL, 4, NULL);
     xTaskCreate(command_worker_task,    "cmd_worker",  4096, NULL, 5, NULL);
