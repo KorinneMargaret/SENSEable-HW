@@ -226,21 +226,27 @@ char tenant_id[32] = DEFAULT_TENANT_ID;
 #define I2C_MASTER_SDA_IO   21
 #define I2C_MASTER_SCL_IO   22
 #define TCA4307_EN_GPIO     15   // LLC-boosted hardware gate (harmless if the TCA4307 is bypassed)
-#define I2C_MASTER_FREQ_HZ  10000    // ponytail: 10 kHz diagnostic; set back to 100000 once the PCB bus is fixed
-// Per-transfer timeout. A flash erase (LittleFS spooling) can stall the CPU for
-// tens to hundreds of ms; 100 ms was short enough for that stall to abort an
-// in-progress transfer. A healthy transfer still completes in under 1 ms, and
-// an absent device still NACKs immediately, so this only matters when stalled.
-#define I2C_XFER_TIMEOUT_MS 500
-
-// Same purpose, but fixes the cause: lets the I2C interrupt keep running while
-// flash is being written. Enable in menuconfig (I2C driver options, "ISR
-// IRAM-safe"); the option name can differ between ESP-IDF versions.
+#define I2C_MASTER_FREQ_HZ  100000
+// I2C ISR IRAM-safe lets the I2C interrupt keep running while flash is being
+// written. Enable in menuconfig (I2C driver options, "ISR IRAM-safe"); the
+// option name can differ between ESP-IDF versions.
 // (Reported at boot as a log line; a compile-time #warning breaks -Werror builds.)
 #if defined(CONFIG_I2C_ISR_IRAM_SAFE) && CONFIG_I2C_ISR_IRAM_SAFE
 #define I2C_IRAM_SAFE_ENABLED 1
 #else
 #define I2C_IRAM_SAFE_ENABLED 0
+#endif
+
+// Per-transfer timeout. A healthy transfer completes in under 1 ms and an absent
+// device NACKs immediately, so this only bounds a FAILING transfer -- and that
+// bound is how long one bad board can hold the bus from every other board.
+// Without IRAM-safe, a flash erase (LittleFS spooling) can stall the ISR for
+// hundreds of ms, so 500 ms is needed; with it, 100 ms is safe and a bad board
+// costs 5x less bus time.
+#if I2C_IRAM_SAFE_ENABLED
+#define I2C_XFER_TIMEOUT_MS 100
+#else
+#define I2C_XFER_TIMEOUT_MS 500
 #endif
 #define DS3231_ADDR         0x68
 #define DS3231_REG_TIME     0x00
@@ -884,6 +890,10 @@ static int perform_i2c_probe_pass(bool *rtc_ok) {
     bool online[4];
     int found = 0;
     for (int i = 0; i < 4; i++) {
+        if (safe_eject_active) {             // switch flipped mid-pass: results would be meaningless
+            xSemaphoreGive(i2c_mutex);
+            return -1;
+        }
         bool ack = !bus_fault &&
                    probe_addr(possible_addresses[i]) == ESP_OK;
         if (ack) probe_misses[i] = 0;
@@ -937,7 +947,7 @@ static void scan_i2c_bus(void) {
     bool rtc_ok = false;
     int found = perform_i2c_probe_pass(&rtc_ok);
 
-    if (found == -1) return;                            // bus busy; try again next cycle
+    if (found == -1 || safe_eject_active) return;       // bus busy or eject began mid-pass; try again next cycle
     if (found > 0 || rtc_ok) fault_cooldown_ms = I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS;  // bus works
     if (found > 0) { zero_chip_recovery_attempts = 0; return; }
 
@@ -978,13 +988,26 @@ static void apply_safe_eject(bool active) {
     if (active) {
         // Wait for any in-flight transaction to finish before dropping the gate.
         // Gating mid-transaction would leave a slave holding SDA low.
-        bool got_bus = (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(500)) == pdTRUE);
+        // 2 s: on a faulted bus one probe pass can hold the mutex well over 500 ms
+        // (each failing transfer may run to I2C_XFER_TIMEOUT_MS).
+        bool got_bus = (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(2000)) == pdTRUE);
         safe_eject_active = true;
         gpio_set_level(TCA4307_EN_GPIO, 0);    // fault LED now slow-blinks (network_led_task)
         if (got_bus) xSemaphoreGive(i2c_mutex);
         ESP_LOGW(TAG, ">>> SAFE EJECT ACTIVATED: bus quiesced, gate locked (GPIO %d)%s <<<",
-                 TCA4307_EN_GPIO, got_bus ? "" : " [bus was busy >500 ms]");
+                 TCA4307_EN_GPIO, got_bus ? "" : " [bus was busy >2 s]");
     } else {
+        // Boards may have been swapped during the eject: forget every ADS handle,
+        // so a chip counts as present only once it answers a fresh probe. Without
+        // this, a removed board kept its handle for 3 more scans and its read
+        // errors escalated to a full bus teardown.
+        if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            for (int i = 0; i < 4; i++) {
+                if (ads_handles[i] != NULL) { i2c_master_bus_rm_device(ads_handles[i]); ads_handles[i] = NULL; }
+                probe_misses[i] = PROBE_MISS_LIMIT;
+            }
+            xSemaphoreGive(i2c_mutex);
+        }
         // Raise the gate and let it settle BEFORE clearing the flag, so no task
         // touches the bus during the gate's pre-charge.
         gpio_set_level(TCA4307_EN_GPIO, 1);
@@ -1041,11 +1064,15 @@ static uint8_t evaluate_port_status(int16_t raw_value) {
 }
 
 void ads_reader_task(void *pvParameter) {
-    int consecutive_bus_errors = 0;
+    // Counted per chip: with one counter for the whole bus, a single flaky or
+    // unplugged board tore down the bus (and every other board) within one sweep.
+    int  chip_errors[4] = {0};
+    bool chip_warned[4] = {false};   // one RTC check + log per failure run
 
     while (1) {
         if (safe_eject_active) {
-            consecutive_bus_errors = 0;
+            memset(chip_errors, 0, sizeof(chip_errors));
+            memset(chip_warned, 0, sizeof(chip_warned));
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
@@ -1096,16 +1123,17 @@ void ads_reader_task(void *pvParameter) {
                     if (conv_done &&
                         i2c_master_transmit_receive(ads_handles[i], &conv_ptr, 1, buf, sizeof(buf), I2C_XFER_TIMEOUT_MS) == ESP_OK) {
                         final_val = (int16_t)((buf[0] << 8) | buf[1]);
-                        consecutive_bus_errors = 0;
+                        chip_errors[i] = 0;
+                        chip_warned[i] = false;
                     } else {
-                        consecutive_bus_errors++;
+                        chip_errors[i]++;
                         if (!conv_done && !bus_error) {
                             ESP_LOGW(TAG, "ADS 0x%02X ch%d: conversion did not complete in %d ms",
                                      global_node_data[i].address, channel, ADS_CONV_POLL_MAX_TRIES);
                         }
                     }
                 } else {
-                    consecutive_bus_errors++;
+                    chip_errors[i]++;
                 }
 
                 xSemaphoreGive(i2c_mutex);
@@ -1121,16 +1149,37 @@ void ads_reader_task(void *pvParameter) {
             }
         }
 
-        // A single NACK localises to a -9999 on one channel. Only a sustained
-        // fault escalates to a full bus teardown.
-        if (consecutive_bus_errors >= ADS_SUSTAINED_ERROR_LIMIT && !safe_eject_active) {
-            ESP_LOGW(TAG, "Sustained I2C fault (%d consecutive channel errors). Triggering inline recovery...",
-                     consecutive_bus_errors);
-            consecutive_bus_errors = 0;
-            last_zero_chip_recovery_tick = xTaskGetTickCount();
-            recover_i2c_bus();
-            xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
-            vTaskDelay(pdMS_TO_TICKS(5000));
+        // A single NACK localises to a -9999 on one channel. When one chip keeps
+        // failing, the RTC is asked once: if it answers, the bus is fine and only
+        // that board is bad, so nothing is torn down -- its channels report -9999
+        // and the probe pass drops it if it stops answering altogether. Only a bus
+        // the RTC can't use gets a full teardown.
+        for (int i = 0; i < 4 && !safe_eject_active; i++) {
+            if (chip_errors[i] < ADS_SUSTAINED_ERROR_LIMIT || chip_warned[i]) continue;
+
+            bool bus_ok = false;
+            if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                // Two tries: one stray NACK must not tear down a working bus.
+                bus_ok = (bus_handle != NULL &&
+                          (probe_addr(DS3231_ADDR) == ESP_OK || probe_addr(DS3231_ADDR) == ESP_OK));
+                xSemaphoreGive(i2c_mutex);
+            }
+
+            if (bus_ok) {
+                ESP_LOGW(TAG, "ADS 0x%02X failing (%d reads in a row) but bus and RTC OK; check that board's power and wiring.",
+                         possible_addresses[i], chip_errors[i]);
+                chip_warned[i] = true;   // no repeat until a good read resets it
+            } else {
+                ESP_LOGW(TAG, "Sustained I2C fault (ADS 0x%02X: %d errors, RTC not answering). Triggering inline recovery...",
+                         possible_addresses[i], chip_errors[i]);
+                last_zero_chip_recovery_tick = xTaskGetTickCount();
+                recover_i2c_bus();
+                memset(chip_errors, 0, sizeof(chip_errors));
+                memset(chip_warned, 0, sizeof(chip_warned));
+                xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                break;
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -1831,8 +1880,19 @@ static bool is_sensor_attached(int16_t raw_value) {
 static uint8_t port_stable_count[4][4]   = {{0}};
 static bool    port_last_raw_state[4][4] = {{false}};
 static bool    port_believed_state[4][4] = {{false}};
+static bool    port_known[4][4]          = {{false}};   // false until the first sample after (re)appearing
 
 static bool debounce_port_state(int chip, int ch, bool raw_now) {
+    // First sample after a chip appears (or a port is re-enabled) is taken as-is.
+    // Debouncing from an assumed "false" made every new chip report DISCONNECTED
+    // for ~9 s, and the backend reacted by sending sensor_port_down.
+    if (!port_known[chip][ch]) {
+        port_known[chip][ch]          = true;
+        port_last_raw_state[chip][ch] = raw_now;
+        port_believed_state[chip][ch] = raw_now;
+        port_stable_count[chip][ch]   = PORT_DEBOUNCE_SAMPLES;
+        return raw_now;
+    }
     if (raw_now == port_last_raw_state[chip][ch]) {
         if (port_stable_count[chip][ch] < PORT_DEBOUNCE_SAMPLES) port_stable_count[chip][ch]++;
     } else {
@@ -1873,6 +1933,8 @@ void discovery_builder_task(void *pvParameter) {
                         bool attached     = debounce_port_state(i, channel, raw_attached);
                         local_port_connected_map[i][channel] = attached;
                         if (attached) current_detailed_topology |= (1UL << bit_shift_index);
+                    } else {
+                        port_known[i][channel] = false;
                     }
                     bit_shift_index++;
                 }
