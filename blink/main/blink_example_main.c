@@ -333,6 +333,16 @@ static cmd_msg_t cmd_staging;
 // ==========================================
 static volatile bool sntp_sync_pending = false;
 
+// Set when the clock was seeded from a DS3231 whose oscillator had stopped
+// (OSF=1): the time is usable but may be behind (seen: 87 min). Until SNTP
+// confirms it, rows are spooled with their uptime so the replay can re-time
+// them exactly; if SNTP never comes (edge mode, no internet) they keep the
+// RTC's timestamp, which beats an undatable row.
+static volatile bool clock_provisional = false;
+
+static time_t node_epoch(void);
+static bool clock_trusted(void) { return node_epoch() >= MIN_VALID_EPOCH && !clock_provisional; }
+
 // Distinguishes this boot from earlier ones, so a spooled row's uptime can only
 // be converted back to wall-clock time within the boot that recorded it.
 static uint32_t boot_id = 0;
@@ -530,6 +540,7 @@ static void seed_system_time_from_ds3231(bool at_boot) {
     }
     struct timeval tv = { .tv_sec = rtc, .tv_usec = 0 };
     settimeofday(&tv, NULL);
+    clock_provisional = osf;
 
     if (at_boot) {
         char iso[32];
@@ -541,8 +552,8 @@ static void seed_system_time_from_ds3231(bool at_boot) {
         // cycle). Still used: on the local edge with no internet there is no
         // SNTP, and a slightly late timestamp beats an undatable row.
         if (osf) {
-            ESP_LOGW(TAG, "DS3231 oscillator stopped since its last sync (OSF=1): time may be behind until SNTP. "
-                          "Check the RTC backup battery.");
+            ESP_LOGW(TAG, "DS3231 oscillator stopped since its last sync (OSF=1): time may be behind. "
+                          "Telemetry is held on flash and re-timed once SNTP syncs.");
         }
     }
 }
@@ -551,6 +562,7 @@ static void seed_system_time_from_ds3231(bool at_boot) {
 // time_sync_task, where blocking on the I2C mutex is acceptable.
 static void on_sntp_sync(struct timeval *tv) {
     (void)tv;
+    clock_provisional = false;   // SNTP has already set the real time
     sntp_sync_pending = true;
 }
 
@@ -784,7 +796,7 @@ static void spool_append_line(const char *payload) {
 // records uptime ("_up") and this boot's ID ("_b"). The replay uses them to
 // re-time the row once SNTP has synced, then strips them before publishing.
 static void spool_telemetry_root(cJSON *root) {
-    if (node_epoch() < MIN_VALID_EPOCH) {
+    if (!clock_trusted()) {
         cJSON_AddNumberToObject(root, "_up", uptime_sec());
         cJSON_AddNumberToObject(root, "_b", (double)boot_id);
     }
@@ -1909,7 +1921,7 @@ void telemetry_builder_task(void *pvParameter) {
         // Until the clock is valid, spool instead of publishing live: a live row
         // stamped with time-since-boot is dropped by the backend, while a spooled
         // row records its uptime and is re-timed by the replay once SNTP syncs.
-        if (is_mqtt_connected && mqtt_client != NULL && node_epoch() >= MIN_VALID_EPOCH) {
+        if (is_mqtt_connected && mqtt_client != NULL && clock_trusted()) {
             // Hand the row to telemetry_publisher_task and never wait for it: if
             // the publisher is stuck behind a stalled MQTT write, the row goes to
             // flash instead of being lost.
@@ -2161,11 +2173,11 @@ void backlog_replay_task(void *pvParameter) {
             // Give SNTP a chance first: rows recorded before the clock was valid
             // can only be re-timed once it is, and the backend drops them otherwise.
             TickType_t wait_start = xTaskGetTickCount();
-            while (node_epoch() < MIN_VALID_EPOCH && is_mqtt_connected &&
+            while (!clock_trusted() && is_mqtt_connected &&
                    (xTaskGetTickCount() - wait_start) < pdMS_TO_TICKS(REPLAY_WAIT_FOR_TIME_MS)) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
             }
-            if (node_epoch() < MIN_VALID_EPOCH) {
+            if (!clock_trusted()) {
                 ESP_LOGW(TAG, "Clock still not valid after %d s; replaying anyway (pre-sync rows will be undatable).",
                          REPLAY_WAIT_FOR_TIME_MS / 1000);
             }
@@ -2179,7 +2191,7 @@ void backlog_replay_task(void *pvParameter) {
                 while (fgets(line, sizeof(line), f) != NULL) if (line[0] != '\n' && line[0] != '\0') total++;
                 rewind(f);
                 ESP_LOGW(TAG, "Link restored. Replaying %d spooled rows (~%d s)...", total, (total * 150) / 1000 + 1);
-                int sent = 0, retimed = 0, undatable = 0, skipped = 0;
+                int sent = 0, retimed = 0, rtc_timed = 0, undatable = 0, skipped = 0;
 
                 while (fgets(line, sizeof(line), f) != NULL) {
                     line[strcspn(line, "\r\n")] = '\0';
@@ -2194,14 +2206,18 @@ void backlog_replay_task(void *pvParameter) {
                     cJSON *bid_item = cJSON_GetObjectItem(saved, "_b");
                     if (cJSON_IsNumber(up_item)) {
                         time_t now = node_epoch();
-                        if (now >= MIN_VALID_EPOCH && cJSON_IsNumber(bid_item) &&
+                        if (clock_trusted() && cJSON_IsNumber(bid_item) &&
                             (uint32_t)bid_item->valuedouble == boot_id) {
                             double age = uptime_sec() - up_item->valuedouble;
                             if (age < 0) age = 0;
                             cJSON_ReplaceItemInObject(saved, "ts", cJSON_CreateNumber((double)now - age));
                             retimed++;
                         } else {
-                            undatable++;   // recorded in an earlier boot: cannot be recovered
+                            // Earlier boot, or SNTP never came: keep the recorded ts if it is a
+                            // real date (taken from an RTC that had stopped), else it is lost.
+                            cJSON *ts_old = cJSON_GetObjectItem(saved, "ts");
+                            if (cJSON_IsNumber(ts_old) && ts_old->valuedouble >= MIN_VALID_EPOCH) rtc_timed++;
+                            else undatable++;
                         }
                         cJSON_DeleteItemFromObject(saved, "_up");
                         cJSON_DeleteItemFromObject(saved, "_b");
@@ -2238,8 +2254,8 @@ void backlog_replay_task(void *pvParameter) {
 
                 if (replay_complete) {
                     remove(SPOOL_REPLAY_PATH);
-                    ESP_LOGI(TAG, "Backlog replay complete: %d rows sent (%d re-timed, %d undatable), %d skipped. Spool cleared.",
-                             sent, retimed, undatable, skipped);
+                    ESP_LOGI(TAG, "Backlog replay complete: %d rows sent (%d re-timed, %d with RTC time only, %d undatable), %d skipped. Spool cleared.",
+                             sent, retimed, rtc_timed, undatable, skipped);
                 } else {
                     // The whole file is replayed again on reconnect: rows already sent
                     // over a link that was dying may never have arrived, so they are
