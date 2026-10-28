@@ -73,6 +73,8 @@ static const char *HTML_CONFIG_PAGE =
 "<input type=\"text\" name=\"sec_uri\" placeholder=\"mqtts://...\" value=\"%s\" required>"
 "<label>Time Server <span style=\"font-weight:normal;color:#718096;\">(laptop IP; blank = %s)</span></label>"
 "<input type=\"text\" name=\"ntp_srv\" maxlength=\"63\" pattern=\"^[A-Za-z0-9.\\-]*$\" title=\"IP address or host name\" placeholder=\"%s\" value=\"%s\">"
+"<label>Telemetry Interval (seconds) <span style=\"font-weight:normal;color:#718096;\">(5-3600; each reading = average over this time)</span></label>"
+"<input type=\"number\" name=\"tlm_s\" min=\"5\" max=\"3600\" step=\"1\" value=\"%lu\" required>"
 "<label>Tenant ID</label>"
 "<input type=\"text\" name=\"tenant_id\" pattern=\"^[a-z0-9]{2,12}-[a-f0-9]{4}$\" title=\"Must be in format e.g. llda-add4\" placeholder=\"e.g. llda-add4\" value=\"%s\" required>"
 
@@ -154,6 +156,7 @@ static esp_err_t get_root_handler(httpd_req_t *req) {
     char saved_uri[128] = "";
     char saved_tenant[32] = "";
     char saved_ntp[64] = "";
+    uint32_t saved_tlm_ms = 60000;   // default; remote setting wins, then the portal's
 
     // Fetch existing configurations
     if (nvs_open("senseable", NVS_READONLY, &h) == ESP_OK) {
@@ -165,6 +168,7 @@ static esp_err_t get_root_handler(httpd_req_t *req) {
         len = sizeof(saved_uri); nvs_get_str(h, "sec_uri", saved_uri, &len);
         len = sizeof(saved_tenant); nvs_get_str(h, "tenant_id", saved_tenant, &len);
         len = sizeof(saved_ntp); nvs_get_str(h, "ntp_srv", saved_ntp, &len);
+        if (nvs_get_u32(h, "tlm_ms", &saved_tlm_ms) != ESP_OK) nvs_get_u32(h, "tlm_ms_p", &saved_tlm_ms);
         
         nvs_close(h);
     }
@@ -188,6 +192,7 @@ static esp_err_t get_root_handler(httpd_req_t *req) {
              saved_apn,
              saved_uri,
              ntp_blank, ntp_blank, ntp_shown,
+             (unsigned long)(saved_tlm_ms / 1000),
              saved_tenant);
 
     httpd_resp_set_type(req, "text/html");
@@ -215,6 +220,7 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
     char clean_ssid[64] = {0}, clean_pass[64] = {0}, clean_sec_uri[128] = {0}, clean_tenant[32] = {0}, clean_apn[64] = {0};
     char clean_ntp[64] = {0};
     bool ntp_field_sent = false;
+    long tlm_s = -1;
     uint8_t mode_val = 0;
 
     if (httpd_query_key_value(buf, "hw_mode", raw_val, sizeof(raw_val)) == ESP_OK) mode_val = (uint8_t)atoi(raw_val);
@@ -223,6 +229,11 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
     if (httpd_query_key_value(buf, "apn", raw_val, sizeof(raw_val)) == ESP_OK) url_decode(clean_apn, raw_val, sizeof(clean_apn));
     if (httpd_query_key_value(buf, "sec_uri", raw_val, sizeof(raw_val)) == ESP_OK) url_decode(clean_sec_uri, raw_val, sizeof(clean_sec_uri));
     if (httpd_query_key_value(buf, "tenant_id", raw_val, sizeof(raw_val)) == ESP_OK) url_decode(clean_tenant, raw_val, sizeof(clean_tenant));
+    if (httpd_query_key_value(buf, "tlm_s", raw_val, sizeof(raw_val)) == ESP_OK) {
+        char *end = NULL;
+        long v = strtol(raw_val, &end, 10);
+        if (end != raw_val && *end == '\0' && v >= 5 && v <= 3600) tlm_s = v;   // else keep the old value
+    }
     if (httpd_query_key_value(buf, "ntp_srv", raw_val, sizeof(raw_val)) == ESP_OK) {
         ntp_field_sent = true;
         url_decode(clean_ntp, raw_val, sizeof(clean_ntp));
@@ -282,6 +293,11 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
         // Blank (or rejected) time server = erase it, so the default applies.
         if (strlen(clean_ntp) > 0)  nvs_set_str(h, "ntp_srv", clean_ntp);
         else if (ntp_field_sent)    nvs_erase_key(h, "ntp_srv");
+        // Portal interval; clears any remote (dashboard) value so this one applies.
+        if (tlm_s > 0) {
+            nvs_set_u32(h, "tlm_ms_p", (uint32_t)tlm_s * 1000);
+            nvs_erase_key(h, "tlm_ms");
+        }
         
         nvs_commit(h); 
         

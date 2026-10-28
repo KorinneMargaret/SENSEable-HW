@@ -93,11 +93,19 @@ static const char *TAG = "THESIS_NODE";
 // ==========================================
 // TIMING & NETWORK TIMEOUT CONFIGURATIONS
 // ==========================================
-#define TELEMETRY_INTERVAL_MS               10000
+// Telemetry interval: set from the captive portal ("tlm_ms_p") or remotely with
+// set_interval ("tlm_ms"); the remote value wins and is cleared on a tenant change.
+#define TLM_INTERVAL_DEFAULT_MS             60000
+#define TLM_INTERVAL_MIN_MS                 5000
+#define TLM_INTERVAL_MAX_MS                 3600000
+// Every enabled port is sampled once per ADS_SAMPLE_PERIOD_MS; telemetry sends
+// the mean (plus n, min, max) of the samples taken since the previous row.
+#define ADS_SAMPLE_PERIOD_MS                1000
+#define ADS_SATURATION_COUNTS               32760
+#define HEALTH_LOG_PERIOD_MS                60000
 #define DISCOVERY_HEARTBEAT_MS              60000
 #define I2C_FAST_SCAN_INTERVAL_MS           3000
 #define I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS  10000
-#define HEALTH_LOG_EVERY_N_CYCLES           6      // one health line per minute
 
 // --- Cloud & MQTT Timers ---
 // How long a write to a dead link may block before the client gives up and
@@ -313,6 +321,55 @@ NodeData global_node_data[4];
 // the user enables it (sensor_port_up); the choice is kept in NVS ("port_map",
 // bit chip*4+ch) so it survives reboots without the backend resending it.
 bool port_active[4][4] = {{false}};
+
+static volatile uint32_t tlm_interval_ms = TLM_INTERVAL_DEFAULT_MS;
+static volatile bool     disco_force = false;   // publish a disco now (e.g. interval changed)
+
+// Per-port statistics for the current telemetry window. Guarded by data_mutex.
+// Failed reads (-9999) are counted but kept out of the mean; one saturated
+// sample marks the whole window saturated, since a mean would hide it.
+typedef struct {
+    int64_t  sum;
+    uint32_t n;        // good samples
+    uint32_t fails;    // failed reads
+    int16_t  min, max;
+    bool     sat;
+} port_acc_t;
+static port_acc_t port_acc[4][4];
+
+static void acc_reset_chip(int c) { memset(port_acc[c], 0, sizeof(port_acc[c])); }
+
+static void acc_add(int c, int ch, int16_t v) {
+    port_acc_t *a = &port_acc[c][ch];
+    if (v == -9999) { a->fails++; return; }
+    if (a->n == 0 || v < a->min) a->min = v;
+    if (a->n == 0 || v > a->max) a->max = v;
+    a->sum += v;
+    a->n++;
+    if (v >= ADS_SATURATION_COUNTS || v <= -ADS_SATURATION_COUNTS) a->sat = true;
+}
+
+static uint32_t clamp_interval_ms(uint32_t ms) {
+    if (ms < TLM_INTERVAL_MIN_MS) return TLM_INTERVAL_MIN_MS;
+    if (ms > TLM_INTERVAL_MAX_MS) return TLM_INTERVAL_MAX_MS;
+    return ms;
+}
+
+// Boot: remote value ("tlm_ms") if this tenant set one, else the portal's
+// ("tlm_ms_p"), else the default. A new tenant does not inherit the old
+// tenant's remote setting, but keeps what the installer typed in the portal.
+static void load_tlm_interval(bool same_tenant) {
+    nvs_handle_t h;
+    uint32_t ms = TLM_INTERVAL_DEFAULT_MS, v = 0;
+    if (nvs_open("senseable", NVS_READWRITE, &h) == ESP_OK) {
+        if (!same_tenant) { nvs_erase_key(h, "tlm_ms"); nvs_commit(h); }
+        if (nvs_get_u32(h, "tlm_ms", &v) == ESP_OK || nvs_get_u32(h, "tlm_ms_p", &v) == ESP_OK) ms = v;
+        nvs_close(h);
+    }
+    tlm_interval_ms = clamp_interval_ms(ms);
+    ESP_LOGI(TAG, "Telemetry: mean of 1 sample/s per port, sent every %lu s.",
+             (unsigned long)(tlm_interval_ms / 1000));
+}
 
 static void save_port_map(void) {
     uint16_t m = 0;
@@ -1113,6 +1170,7 @@ static void mark_bus_offline(void) {
         for (int i = 0; i < 4; i++) {
             global_node_data[i].is_online = false;
             for (int ch = 0; ch < 4; ch++) global_node_data[i].port_values[ch] = ADS_NO_DATA;
+            acc_reset_chip(i);
         }
         num_ads_found = 0;
         xSemaphoreGive(data_mutex);
@@ -1285,6 +1343,7 @@ static int perform_i2c_probe_pass(bool *rtc_ok) {
             global_node_data[i].address = possible_addresses[i];
             if (!online[i] || !global_node_data[i].is_online) {   // offline, or just came online
                 for (int ch = 0; ch < 4; ch++) global_node_data[i].port_values[ch] = ADS_NO_DATA;
+                acc_reset_chip(i);   // a re-plugged board starts a fresh window
             }
             global_node_data[i].is_online = online[i];
         }
@@ -1446,10 +1505,12 @@ void eject_button_task(void *pvParameter) {
 // ==========================================
 // ADS1115 POLLING TASK (ATOMIC)
 // ==========================================
-static uint8_t evaluate_port_status(int16_t raw_value) {
-    if (raw_value == -9999) return 3;
-    if (raw_value >= 32760 || raw_value <= -32760) return 2;
-    if (raw_value >= -5 && raw_value <= 5) return 1;
+// Port status for a window: 3 = no readable sample, 2 = saturated at any
+// moment, 1 = mean within +/-5 counts (likely nothing attached), 0 = normal.
+static uint8_t window_status(const port_acc_t *a, int16_t mean) {
+    if (a->n == 0) return 3;
+    if (a->sat) return 2;
+    if (mean >= -5 && mean <= 5) return 1;
     return 0;
 }
 
@@ -1466,6 +1527,7 @@ void ads_reader_task(void *pvParameter) {
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
+        TickType_t pass_start = xTaskGetTickCount();
 
         for (int i = 0; i < 4; i++) {
             if (ads_handles[i] == NULL || !global_node_data[i].is_online) continue;
@@ -1530,7 +1592,8 @@ void ads_reader_task(void *pvParameter) {
                 xSemaphoreGive(i2c_mutex);
 
                 if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
-                    global_node_data[i].port_values[channel] = final_val;
+                    global_node_data[i].port_values[channel] = final_val;   // latest: disco / hot-plug
+                    acc_add(i, channel, final_val);                         // window stats: telemetry
                     xSemaphoreGive(data_mutex);
                 }
 
@@ -1573,7 +1636,11 @@ void ads_reader_task(void *pvParameter) {
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        // One sample per enabled port per ADS_SAMPLE_PERIOD_MS: a predictable n
+        // per window, and the bus stays mostly idle for scans and the RTC.
+        TickType_t used = xTaskGetTickCount() - pass_start;
+        TickType_t period = pdMS_TO_TICKS(ADS_SAMPLE_PERIOD_MS);
+        vTaskDelay(used < period ? period - used : 1);
     }
 }
 
@@ -1827,6 +1894,34 @@ static void process_incoming_command(const char *json_string, size_t length, int
             send_command_ack(cid_buf, action, "failed", "Missing numeric 'chip' or 'ch' parameters");
         }
     }
+    // --- ACTION: SET TELEMETRY INTERVAL ---
+    // {"action":"set_interval","ms":60000}. Saved as this tenant's setting
+    // ("tlm_ms"); takes effect at once. A new disco reports the new value.
+    else if (strcmp(action, "set_interval") == 0) {
+        cJSON *ms_item = cJSON_GetObjectItem(root, "ms");
+        if (!cJSON_IsNumber(ms_item)) {
+            send_command_ack(cid_buf, action, "failed", "Missing numeric 'ms'");
+        } else if (ms_item->valuedouble < TLM_INTERVAL_MIN_MS || ms_item->valuedouble > TLM_INTERVAL_MAX_MS) {
+            char d[80];
+            snprintf(d, sizeof(d), "Interval out of range (%d-%d ms)", TLM_INTERVAL_MIN_MS, TLM_INTERVAL_MAX_MS);
+            send_command_ack(cid_buf, action, "failed", d);
+        } else {
+            uint32_t ms = (uint32_t)ms_item->valuedouble;
+            tlm_interval_ms = ms;
+            nvs_handle_t h;
+            bool saved = false;
+            if (nvs_open("senseable", NVS_READWRITE, &h) == ESP_OK) {
+                saved = nvs_set_u32(h, "tlm_ms", ms) == ESP_OK && nvs_commit(h) == ESP_OK;
+                nvs_close(h);
+            }
+            disco_force = true;
+            xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);   // wake the disco task
+            ESP_LOGW(TAG, "Telemetry interval set to %lu ms%s.", (unsigned long)ms, saved ? "" : " (NOT saved: reverts on reboot)");
+            char d[80];
+            snprintf(d, sizeof(d), "Telemetry interval set to %lu ms%s", (unsigned long)ms, saved ? "" : " (not saved to flash)");
+            send_command_ack(cid_buf, action, "completed", d);
+        }
+    }
     // --- ACTION: PING (latency test) ---
     else if (strcmp(action, "ping") == 0) {
         send_ping_reply(cid_buf, rx_ms, root);
@@ -1885,6 +1980,7 @@ static void publish_node_config(void) {
                             current_route_state == ROUTE_CLOUD ? pri_broker_uri : sec_broker_uri);
     cJSON_AddStringToObject(root, "edge_broker", saved_uri);
     cJSON_AddStringToObject(root, "ntp_server", ntp_server[0] ? ntp_server : "pool.ntp.org");
+    cJSON_AddNumberToObject(root, "tlm_interval_ms", tlm_interval_ms);
     // Why this boot started, and where the previous one was when it ended, so the
     // dashboard can show unexpected restarts without a serial cable attached.
     cJSON_AddStringToObject(root, "last_reset", prev_reset_reason);
@@ -2274,10 +2370,36 @@ void telemetry_publisher_task(void *pvParameter) {
 // ==========================================
 // TELEMETRY BUILDER
 // ==========================================
+static void log_health(void) {
+    ESP_LOGI(TAG, "Health: heap=%" PRIu32 " min_heap=%" PRIu32 " outbox=%d route=%s mqtt=%d chips=%d interval=%lus",
+             esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
+             mqtt_client ? esp_mqtt_client_get_outbox_size(mqtt_client) : -1,
+             current_route_state == ROUTE_CLOUD ? "CLOUD" : "LOCAL",
+             is_mqtt_connected, num_ads_found, (unsigned long)(tlm_interval_ms / 1000));
+}
+
+// One row per window. Each enabled port sends [ch, mean, status, n, min, max]
+// over the samples taken since the previous row (1 per second). A port with
+// only failed reads sends [ch, -9999, 3, 0, -9999, -9999]; a port with no
+// attempt yet (just enabled) is left out. "win_ms" is the window actually
+// covered: shorter for the first row after boot or after an interval change.
 void telemetry_builder_task(void *pvParameter) {
-    uint32_t cycle = 0;
+    TickType_t window_start = xTaskGetTickCount();
+    TickType_t last_health  = window_start;
 
     while (1) {
+        // Wait for the end of the window, re-reading the interval every second
+        // so a set_interval takes effect at once (a shorter one may end it now).
+        TickType_t now;
+        while (1) {
+            now = xTaskGetTickCount();
+            if ((now - last_health) >= pdMS_TO_TICKS(HEALTH_LOG_PERIOD_MS)) { last_health = now; log_health(); }
+            TickType_t due = window_start + pdMS_TO_TICKS(tlm_interval_ms);
+            if ((int32_t)(now - due) >= 0) break;
+            TickType_t left = due - now;
+            vTaskDelay(left < pdMS_TO_TICKS(1000) ? left : pdMS_TO_TICKS(1000));
+        }
+
         cJSON *root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "t", "tlm");
         cJSON_AddNumberToObject(root, "v", 1);
@@ -2285,6 +2407,7 @@ void telemetry_builder_task(void *pvParameter) {
         cJSON_AddStringToObject(root, "nid", node_id);
         cJSON_AddStringToObject(root, "net", (current_hw_mode == HW_MODE_CELLULAR) ? "cell" : "wifi");
         cJSON_AddNumberToObject(root, "ts", (double)node_epoch());
+        cJSON_AddNumberToObject(root, "win_ms", (double)((now - window_start) * portTICK_PERIOD_MS));
 
         cJSON *adc_array = cJSON_AddArrayToObject(root, "adc");
 
@@ -2298,14 +2421,25 @@ void telemetry_builder_task(void *pvParameter) {
 
                 cJSON *ports_array = cJSON_AddArrayToObject(chip_obj, "p");
                 for (int channel = 0; channel < 4; channel++) {
-                    if (port_active[i][channel] && global_node_data[i].port_values[channel] != ADS_NO_DATA) {
-                        int16_t raw_reading = global_node_data[i].port_values[channel];
-                        int port_data[3] = { channel, raw_reading, evaluate_port_status(raw_reading) };
-                        cJSON_AddItemToArray(ports_array, cJSON_CreateIntArray(port_data, 3));
+                    const port_acc_t *a = &port_acc[i][channel];
+                    if (!port_active[i][channel] || (a->n == 0 && a->fails == 0)) continue;
+                    int port_data[6];
+                    if (a->n > 0) {
+                        int64_t q = (a->sum >= 0) ? (a->sum + a->n / 2) / a->n
+                                                  : -((-a->sum + a->n / 2) / a->n);   // rounded mean
+                        int16_t mean = (int16_t)q;
+                        port_data[0] = channel; port_data[1] = mean; port_data[2] = window_status(a, mean);
+                        port_data[3] = (int)a->n; port_data[4] = a->min; port_data[5] = a->max;
+                    } else {
+                        port_data[0] = channel; port_data[1] = -9999; port_data[2] = 3;
+                        port_data[3] = 0; port_data[4] = -9999; port_data[5] = -9999;
                     }
+                    cJSON_AddItemToArray(ports_array, cJSON_CreateIntArray(port_data, 6));
                 }
                 cJSON_AddItemToArray(adc_array, chip_obj);
             }
+            memset(port_acc, 0, sizeof(port_acc));   // next window starts now
+            window_start = now;
             xSemaphoreGive(data_mutex);
         }
 
@@ -2326,16 +2460,6 @@ void telemetry_builder_task(void *pvParameter) {
             spool_telemetry_root(root);
             cJSON_Delete(root);
         }
-
-        if (++cycle % HEALTH_LOG_EVERY_N_CYCLES == 0) {
-            ESP_LOGI(TAG, "Health: heap=%" PRIu32 " min_heap=%" PRIu32 " outbox=%d route=%s mqtt=%d chips=%d",
-                     esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
-                     mqtt_client ? esp_mqtt_client_get_outbox_size(mqtt_client) : -1,
-                     current_route_state == ROUTE_CLOUD ? "CLOUD" : "LOCAL",
-                     is_mqtt_connected, num_ads_found);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_INTERVAL_MS));
     }
 }
 
@@ -2423,7 +2547,9 @@ void discovery_builder_task(void *pvParameter) {
 
         bool topology_changed = (current_detailed_topology != last_detailed_topology);
         bool heartbeat_due = (xTaskGetTickCount() - last_disco_publish) > pdMS_TO_TICKS(DISCOVERY_HEARTBEAT_MS);
-        if (!topology_changed && !heartbeat_due) continue;
+        bool forced = disco_force;
+        if (!topology_changed && !heartbeat_due && !forced) continue;
+        disco_force = false;
 
         last_detailed_topology = current_detailed_topology;
         last_disco_publish = xTaskGetTickCount();
@@ -2435,7 +2561,9 @@ void discovery_builder_task(void *pvParameter) {
         cJSON_AddStringToObject(root, "nid", node_id);
         cJSON_AddStringToObject(root, "net", (current_hw_mode == HW_MODE_CELLULAR) ? "cell" : "wifi");
         if (clock_trusted()) cJSON_AddNumberToObject(root, "ts", (double)node_epoch());
-        cJSON_AddNumberToObject(root, "tlm_interval_ms", TELEMETRY_INTERVAL_MS);
+        cJSON_AddNumberToObject(root, "tlm_interval_ms", tlm_interval_ms);
+        cJSON_AddNumberToObject(root, "sample_ms", ADS_SAMPLE_PERIOD_MS);
+        cJSON_AddStringToObject(root, "tlm_value", "mean");   // ports: [ch, mean, status, n, min, max]
 
         cJSON *bus_array = cJSON_AddArrayToObject(root, "buses");
         if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
@@ -2842,6 +2970,7 @@ void app_main(void) {
             ESP_LOGI(TAG, "Tenant unchanged (%s). Using persistent broker session.", tenant_id);
         }
         load_port_map(have_history && strcmp(last_tid, tenant_id) == 0);
+        load_tlm_interval(have_history && strcmp(last_tid, tenant_id) == 0);
     }
     boot_id = esp_random();
 
