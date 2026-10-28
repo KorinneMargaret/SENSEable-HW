@@ -958,7 +958,8 @@ static esp_err_t i2c_master_init(void) {
 // Releases a slave left holding SDA low -- e.g. a battery-backed DS3231 that was
 // mid-read when the ESP32 reset, or a transfer aborted by a timeout: 9 clocks +
 // STOP, open-drain, ~100 kHz. The I2C driver must not own the pins while it runs.
-static void i2c_bus_clear(void) {
+// Returns true if SDA and SCL both read high afterwards (bus free).
+static bool i2c_bus_clear(void) {
     // Latch the outputs HIGH before enabling them, so enabling open-drain mode
     // cannot pull SDA/SCL low for a moment (a spurious START on the bus).
     gpio_set_level(I2C_MASTER_SDA_IO, 1);
@@ -982,8 +983,50 @@ static void i2c_bus_clear(void) {
     gpio_set_level(I2C_MASTER_SCL_IO, 1); esp_rom_delay_us(5);
     gpio_set_level(I2C_MASTER_SDA_IO, 1); esp_rom_delay_us(5);
 
+    // Outputs are released (high); sample the pads three times, 20 us apart.
+    bool free_lines = true;
+    for (int i = 0; i < 3 && free_lines; i++) {
+        esp_rom_delay_us(20);
+        free_lines = gpio_get_level(I2C_MASTER_SDA_IO) == 1 && gpio_get_level(I2C_MASTER_SCL_IO) == 1;
+    }
+
     gpio_reset_pin(I2C_MASTER_SDA_IO);
     gpio_reset_pin(I2C_MASTER_SCL_IO);
+    return free_lines;
+}
+
+// Bus-held guard. If SDA/SCL are still low after the bus clear, something is
+// holding them electrically (a shorted or unpowered board, missing pull-ups).
+// Creating the I2C driver on such a bus is what crashed the node repeatedly, and
+// it cannot help anyway, so the driver is left down and the lines are only
+// sampled (plain GPIO input, no clocks) each scan until they read high again.
+static volatile bool bus_held = false;
+
+static bool i2c_lines_idle_high(void) {
+    gpio_config_t in_cfg = {
+        .pin_bit_mask = (1ULL << I2C_MASTER_SDA_IO) | (1ULL << I2C_MASTER_SCL_IO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&in_cfg);
+    esp_rom_delay_us(50);
+    bool high = gpio_get_level(I2C_MASTER_SDA_IO) == 1 && gpio_get_level(I2C_MASTER_SCL_IO) == 1;
+    gpio_reset_pin(I2C_MASTER_SDA_IO);
+    gpio_reset_pin(I2C_MASTER_SCL_IO);
+    return high;
+}
+
+static void mark_bus_offline(void) {
+    if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
+        for (int i = 0; i < 4; i++) {
+            global_node_data[i].is_online = false;
+            for (int ch = 0; ch < 4; ch++) global_node_data[i].port_values[ch] = ADS_NO_DATA;
+        }
+        num_ads_found = 0;
+        xSemaphoreGive(data_mutex);
+    }
 }
 
 static void recover_i2c_bus(void) {
@@ -1018,7 +1061,19 @@ static void recover_i2c_bus(void) {
 
         // 3. Release any slave holding SDA low
         crumb("i2c recovery: bus clear");
-        i2c_bus_clear();
+        if (!i2c_bus_clear()) {
+            if (!bus_held) {
+                ESP_LOGE(TAG, "I2C lines still LOW after bus clear: held by hardware (shorted/unpowered board, "
+                              "missing pull-ups). I2C paused; lines checked every scan.");
+            }
+            bus_held = true;
+            crumb("i2c: bus held, driver left down");
+            xSemaphoreGive(i2c_mutex);
+            mark_bus_offline();
+            return;
+        }
+        if (bus_held) ESP_LOGI(TAG, "I2C lines released. Restarting the I2C driver.");
+        bus_held = false;
 
         // 4. Re-initialise the master and restore the RTC
         crumb("i2c recovery: driver re-init");
@@ -1059,11 +1114,30 @@ static esp_err_t probe_addr(uint16_t addr) {
         .scl_speed_hz    = I2C_MASTER_FREQ_HZ
     };
     if (i2c_master_bus_add_device(bus_handle, &cfg, &h) != ESP_OK) return ESP_FAIL;
-    uint8_t reg = (addr == DS3231_ADDR) ? DS3231_REG_STATUS : 0x01, b = 0;   // ADS1115: config register
-    esp_err_t e = i2c_master_transmit_receive(h, &reg, 1, &b, 1, I2C_XFER_TIMEOUT_MS);
+    bool is_rtc = (addr == DS3231_ADDR);
+    uint8_t reg = is_rtc ? DS3231_REG_STATUS : REG_POINTER_CONFIG, b[2] = {0};
+    esp_err_t e = i2c_master_transmit_receive(h, &reg, 1, b, is_rtc ? 1 : 2, I2C_XFER_TIMEOUT_MS);
     i2c_master_bus_rm_device(h);
     if (e != ESP_OK && (gpio_get_level(I2C_MASTER_SDA_IO) == 0 || gpio_get_level(I2C_MASTER_SCL_IO) == 0)) {
         return ESP_ERR_TIMEOUT;
+    }
+    // Phantom-chip filter. A sagging SDA (half-voltage line, ADDR pull-down on
+    // SDA) can fake an ACK; the "chip" then reads all 0s or all 1s. A real
+    // ADS1115 config register is never 0x0000 (single-shot bit and comparator
+    // bits are set at reset and by our writes) and we never write 0xFFFF.
+    if (e == ESP_OK && !is_rtc) {
+        uint16_t v = ((uint16_t)b[0] << 8) | b[1];
+        if (v == 0x0000 || v == 0xFFFF) {
+            static uint8_t phantom_warned = 0;   // bit per address 0x48..0x4B
+            uint8_t bit = (uint8_t)(1u << (addr - 0x48));
+            if (!(phantom_warned & bit)) {
+                ESP_LOGW(TAG, "ADS 0x%02X acknowledged but its config reads 0x%04X: phantom (SDA level bad?). Ignored.",
+                         addr, v);
+                crumb("i2c: phantom ADS ignored");
+            }
+            phantom_warned |= bit;
+            return ESP_ERR_NOT_FOUND;
+        }
     }
     return e;
 }
@@ -1135,6 +1209,14 @@ static int perform_i2c_probe_pass(bool *rtc_ok) {
 
 static void scan_i2c_bus(void) {
     if (safe_eject_active) return;
+
+    if (bus_held) {
+        if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(200)) != pdTRUE) return;
+        bool free_now = i2c_lines_idle_high();
+        xSemaphoreGive(i2c_mutex);
+        if (free_now) recover_i2c_bus();   // lines released: bring the driver back
+        return;
+    }
 
     static uint8_t zero_chip_recovery_attempts = 0;
     static uint32_t fault_cooldown_ms = I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS;
@@ -2641,9 +2723,12 @@ void app_main(void) {
     // reset landed mid-read, it is still holding SDA low: free it before the
     // first transaction, or the boot-time clock seed fails.
     crumb("boot: i2c init");
-    i2c_bus_clear();
-
-    if (i2c_master_init() == ESP_OK) {
+    if (!i2c_bus_clear()) {
+        bus_held = true;
+        ESP_LOGE(TAG, "I2C lines LOW at boot: held by hardware. I2C stays off (no RTC, no sensors) "
+                      "until both lines read high; checked every scan.");
+        crumb("boot: i2c held, driver left down");
+    } else if (i2c_master_init() == ESP_OK) {
         i2c_device_config_t ds_cfg = {
             .dev_addr_length = I2C_ADDR_BIT_LEN_7,
             .device_address = DS3231_ADDR,
