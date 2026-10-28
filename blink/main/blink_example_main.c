@@ -149,6 +149,7 @@ static const uint8_t ADS_MUX_MSB[4] = { 0xC1, 0xD1, 0xE1, 0xF1 };
 #define PORT_DEBOUNCE_SAMPLES       3      // agreeing scans before a change is believed
 
 // --- Zero-chip recovery back-off ---
+#define I2C_HELD_RETRY_MS 30000        // bus held low: re-clock it this often
 #define MAX_ZERO_CHIP_RECOVERIES    3
 // A chip is declared gone only after this many consecutive failed probes, so a
 // single NACK on a marginal bus no longer drops it (and its handle) for a scan.
@@ -348,8 +349,9 @@ static void load_port_map(bool same_tenant) {
 // COMMAND PIPELINE GLOBALS
 // ==========================================
 typedef struct {
-    size_t len;
-    char   payload[MAX_CMD_PAYLOAD_LEN];
+    size_t  len;
+    int64_t rx_ms;     // wall-clock arrival time (ms), 0 before the first SNTP sync
+    char    payload[MAX_CMD_PAYLOAD_LEN];
 } cmd_msg_t;
 
 static QueueHandle_t command_queue = NULL;
@@ -383,6 +385,15 @@ static volatile bool sntp_sync_pending = false;
 // the SNTP callback, read by the telemetry publisher (32-bit, so no tearing).
 static volatile bool     sntp_ever_synced = false;
 static volatile uint32_t sntp_last_sync_s = 0;     // uptime (s) of the last SNTP sync
+
+static int64_t wall_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+static uint32_t sntp_age_s(void) {
+    return (uint32_t)(esp_timer_get_time() / 1000000) - sntp_last_sync_s;
+}
 
 // Set when the clock was seeded from a DS3231 whose oscillator had stopped
 // (OSF=1): the time is usable but may be behind (seen: 87 min). Until SNTP
@@ -809,6 +820,47 @@ static void send_command_ack(const char *cid, const char *action, const char *st
         free(payload);
     }
     cJSON_Delete(ack_root);
+}
+
+// Latency-test ping. Replies at once with publish() (not enqueue(), which can
+// sit up to 1 s in the outbox), so ts_ms is the real send time. Fields:
+//   rx_ms  when the ping reached this node (stamped in the MQTT handler)
+//   ts_ms  when this reply was sent
+//   t0     echoed unchanged from the ping, so the sender needs no bookkeeping
+// rx_ms/ts_ms/sync_age_s only after an SNTP sync this boot (else whole-second
+// RTC time). Round trip = listener receive time - t0, one clock, no sync needed.
+static void send_ping_reply(const char *cid, int64_t rx_ms, cJSON *cmd) {
+    if (!is_mqtt_connected || mqtt_client == NULL) return;
+    cJSON *r = cJSON_CreateObject();
+    if (r == NULL) return;
+    cJSON_AddStringToObject(r, "t", "ack");
+    cJSON_AddNumberToObject(r, "v", 1);
+    cJSON_AddStringToObject(r, "tid", tenant_id);
+    cJSON_AddStringToObject(r, "nid", node_id);
+    cJSON_AddStringToObject(r, "cid", cid);
+    cJSON_AddStringToObject(r, "action", "ping");
+    cJSON_AddStringToObject(r, "status", "completed");
+    cJSON_AddStringToObject(r, "details", "pong");
+    cJSON_AddStringToObject(r, "net", (current_hw_mode == HW_MODE_CELLULAR) ? "cell" : "wifi");
+    cJSON_AddStringToObject(r, "rt", current_route_state == ROUTE_CLOUD ? "cloud" : "edge");
+    cJSON *t0 = cJSON_GetObjectItem(cmd, "t0");
+    if (cJSON_IsNumber(t0)) cJSON_AddNumberToObject(r, "t0", t0->valuedouble);
+    if (clock_trusted()) cJSON_AddNumberToObject(r, "ts", (double)node_epoch());
+    if (sntp_ever_synced) {
+        if (rx_ms > 0) cJSON_AddNumberToObject(r, "rx_ms", (double)rx_ms);
+        cJSON_AddNumberToObject(r, "sync_age_s", (double)sntp_age_s());
+        cJSON_AddNumberToObject(r, "ts_ms", (double)wall_ms());   // last: closest to the send
+    }
+    char *s = cJSON_PrintUnformatted(r);
+    if (s != NULL) {
+        if (esp_mqtt_client_publish(mqtt_client, topic_ack, s, 0, 1, 0) < 0) {
+            ESP_LOGW(TAG, "Ping reply [%s] not sent.", cid);
+        } else {
+            ESP_LOGI(TAG, "Ping reply -> %s", s);
+        }
+        free(s);
+    }
+    cJSON_Delete(r);
 }
 
 // ==========================================
@@ -1249,10 +1301,22 @@ static void scan_i2c_bus(void) {
     if (safe_eject_active) return;
 
     if (bus_held) {
+        // A battery-backed DS3231 cut off mid-byte (e.g. ESP32 reset by flashing)
+        // holds SDA low until it gets clock pulses; reading the pins alone never
+        // frees it. So besides the 3 s pin check, retry the 9-clock bus clear
+        // every 30 s. Harmless on a truly shorted line: the pins are open-drain.
+        static TickType_t last_held_retry = 0;
         if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(200)) != pdTRUE) return;
         bool free_now = i2c_lines_idle_high();
         xSemaphoreGive(i2c_mutex);
-        if (free_now) recover_i2c_bus();   // lines released: bring the driver back
+        TickType_t now = xTaskGetTickCount();
+        if (free_now) {
+            recover_i2c_bus();             // lines released: bring the driver back
+        } else if ((now - last_held_retry) >= pdMS_TO_TICKS(I2C_HELD_RETRY_MS)) {
+            last_held_retry = now;
+            ESP_LOGW(TAG, "I2C still held; retrying bus clear (9 clocks) to free a stuck chip.");
+            recover_i2c_bus();             // stays paused (silently) if still low
+        }
         return;
     }
 
@@ -1539,7 +1603,7 @@ static void cmd_remember(const char *cid) {
 // ==========================================
 // INCOMING COMMAND PARSER (runs in command_worker_task)
 // ==========================================
-static void process_incoming_command(const char *json_string, size_t length) {
+static void process_incoming_command(const char *json_string, size_t length, int64_t rx_ms) {
     if (json_string == NULL || length == 0) return;
 
     cJSON *root = cJSON_ParseWithLength(json_string, length);
@@ -1763,6 +1827,10 @@ static void process_incoming_command(const char *json_string, size_t length) {
             send_command_ack(cid_buf, action, "failed", "Missing numeric 'chip' or 'ch' parameters");
         }
     }
+    // --- ACTION: PING (latency test) ---
+    else if (strcmp(action, "ping") == 0) {
+        send_ping_reply(cid_buf, rx_ms, root);
+    }
     else {
         send_command_ack(cid_buf, action, "failed", "Unknown action");
     }
@@ -1777,7 +1845,7 @@ void command_worker_task(void *pvParameter) {
     static cmd_msg_t msg;   // ~1 KB; static keeps it off this task's stack
     while (1) {
         if (xQueueReceive(command_queue, &msg, portMAX_DELAY) == pdTRUE) {
-            process_incoming_command(msg.payload, msg.len);
+            process_incoming_command(msg.payload, msg.len, msg.rx_ms);
         }
     }
 }
@@ -1898,6 +1966,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "Command Packet Received on [%.*s]: %.*s",
                  event->topic_len, event->topic, event->data_len, event->data);
 
+        cmd_staging.rx_ms = sntp_ever_synced ? wall_ms() : 0;   // ping: arrival time
         cmd_staging.len = (size_t)event->data_len;
         memcpy(cmd_staging.payload, event->data, event->data_len);
         cmd_staging.payload[event->data_len] = '\0';
@@ -2169,12 +2238,8 @@ void cellular_task(void *pvParameter) {
 static void add_send_fields(cJSON *root) {
     cJSON_AddStringToObject(root, "rt", current_route_state == ROUTE_CLOUD ? "cloud" : "edge");
     if (!sntp_ever_synced) return;                     // RTC-only clock: whole seconds, no ts_ms
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    int64_t ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-    cJSON_AddNumberToObject(root, "ts_ms", (double)ms);
-    cJSON_AddNumberToObject(root, "sync_age_s",
-                            (double)((uint32_t)(esp_timer_get_time() / 1000000) - sntp_last_sync_s));
+    cJSON_AddNumberToObject(root, "ts_ms", (double)wall_ms());
+    cJSON_AddNumberToObject(root, "sync_age_s", (double)sntp_age_s());
 }
 
 void telemetry_publisher_task(void *pvParameter) {
