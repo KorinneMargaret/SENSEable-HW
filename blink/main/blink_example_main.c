@@ -295,10 +295,42 @@ typedef struct {
 } NodeData;
 
 NodeData global_node_data[4];
-bool port_active[4][4] = {
-    {true, true, true, true}, {true, true, true, true},
-    {true, true, true, true}, {true, true, true, true}
-};
+// Ports start DISABLED: an unconnected ADS input floats and reports stray
+// voltages, and pull-downs would load the sensors. A port is read only after
+// the user enables it (sensor_port_up); the choice is kept in NVS ("port_map",
+// bit chip*4+ch) so it survives reboots without the backend resending it.
+bool port_active[4][4] = {{false}};
+
+static void save_port_map(void) {
+    uint16_t m = 0;
+    if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
+        for (int c = 0; c < 4; c++) for (int ch = 0; ch < 4; ch++) if (port_active[c][ch]) m |= (uint16_t)(1u << (c * 4 + ch));
+        xSemaphoreGive(data_mutex);
+    }
+    nvs_handle_t h;
+    if (nvs_open("senseable", NVS_READWRITE, &h) == ESP_OK) {
+        if (nvs_set_u16(h, "port_map", m) != ESP_OK || nvs_commit(h) != ESP_OK) {
+            ESP_LOGE(TAG, "Could not save the port map to NVS; it will reset to all-disabled on reboot.");
+        }
+        nvs_close(h);
+    }
+}
+
+// Called once at boot, before any task runs. A different tenant (or no history)
+// starts with every port disabled: the old owner's choices must not carry over.
+static void load_port_map(bool same_tenant) {
+    nvs_handle_t h;
+    if (nvs_open("senseable", NVS_READWRITE, &h) != ESP_OK) return;
+    uint16_t m = 0;
+    if (same_tenant && nvs_get_u16(h, "port_map", &m) == ESP_OK) {
+        for (int c = 0; c < 4; c++) for (int ch = 0; ch < 4; ch++) port_active[c][ch] = (m >> (c * 4 + ch)) & 1;
+    } else if (!same_tenant) {
+        nvs_erase_key(h, "port_map");
+        nvs_commit(h);
+    }
+    nvs_close(h);
+    ESP_LOGI(TAG, "Sensor ports enabled (bit = chip*4+port): 0x%04X", m);
+}
 
 // ==========================================
 // COMMAND PIPELINE GLOBALS
@@ -1085,9 +1117,19 @@ void eject_button_task(void *pvParameter) {
     };
     gpio_config(&btn_cfg);
 
-    // Honour the switch position at boot (level 0 = switch to GND = eject).
-    int last_level = gpio_get_level(EJECT_BUTTON_GPIO);
-    if (last_level == 0) apply_safe_eject(true);
+    // Honour the switch position at boot (level 0 = switch to GND = eject), but
+    // only if it holds for the full debounce window: a single low sample at boot
+    // (a supply glitch) used to start the node in eject mode.
+    int last_level = 1;
+    if (gpio_get_level(EJECT_BUTTON_GPIO) == 0) {
+        bool stable_low = true;
+        for (int t = 0; t < EJECT_DEBOUNCE_MS && stable_low; t += 10) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            stable_low = (gpio_get_level(EJECT_BUTTON_GPIO) == 0);
+        }
+        if (stable_low) { last_level = 0; apply_safe_eject(true); }
+        else ESP_LOGW(TAG, "Eject switch glitched low at boot; ignored.");
+    }
 
     // A change is accepted only after the pin has read the new level on every
     // 10 ms sample for EJECT_DEBOUNCE_MS. A real flip of the switch easily
@@ -1470,13 +1512,16 @@ static void process_incoming_command(const char *json_string, size_t length) {
                 bool set_active = (strcmp(action, "sensor_port_up") == 0);
                 send_command_ack(cid_buf, action, "started", "Modifying software configuration states");
 
+                bool changed = false;
                 if (xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
+                    changed = (port_active[chip_idx][ch_idx] != set_active);
                     if (set_active && !port_active[chip_idx][ch_idx]) {
                         global_node_data[chip_idx].port_values[ch_idx] = ADS_NO_DATA;   // value from before it was disabled is stale
                     }
                     port_active[chip_idx][ch_idx] = set_active;
                     xSemaphoreGive(data_mutex);
                 }
+                if (changed) save_port_map();
                 ESP_LOGW(TAG, "Altered configuration: Chip Index [%d] Port [%d] -> %s",
                          chip_idx, ch_idx, set_active ? "ENABLED" : "DISABLED");
                 xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
@@ -2363,8 +2408,20 @@ void app_main(void) {
     gpio_config(&switch_cfg);
     vTaskDelay(pdMS_TO_TICKS(10));
 
+    // The switch must read GND on every sample for a full second. One sample was
+    // enough before, and a supply glitch on this weakly pulled-up pin (internal
+    // ~45 kOhm only) dropped a running node into the captive portal.
+    int low_samples = 0;
+    for (int i = 0; i < 100; i++) {
+        if (gpio_get_level(PROVISION_SWITCH_GPIO) == 0) low_samples++;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (low_samples > 0 && low_samples < 100) {
+        ESP_LOGW(TAG, "Provisioning switch read GND on %d/100 samples: glitch, ignored. Check its wiring and add a 10k pull-up to 3V3.", low_samples);
+    }
+
     // CAPTIVE PORTAL PROVISIONING MODE
-    if (gpio_get_level(PROVISION_SWITCH_GPIO) == 0) {
+    if (low_samples == 100) {
         ESP_LOGW(TAG, "===============================================");
         ESP_LOGW(TAG, " CONFIG MODE TRIGGERED (SLIDE SWITCH GND)      ");
         ESP_LOGW(TAG, " Broadcasting SoftAP Captive Portal...         ");
@@ -2429,6 +2486,7 @@ void app_main(void) {
         } else {
             ESP_LOGI(TAG, "Tenant unchanged (%s). Using persistent broker session.", tenant_id);
         }
+        load_port_map(have_history && strcmp(last_tid, tenant_id) == 0);
     }
     boot_id = esp_random();
 
