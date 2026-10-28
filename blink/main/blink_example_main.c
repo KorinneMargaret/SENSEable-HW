@@ -49,6 +49,7 @@
 #include "esp_netif.h"
 #include "esp_netif_ppp.h"
 #include "esp_netif_sntp.h"
+#include "esp_sntp.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "mqtt_client.h"
@@ -228,6 +229,16 @@ char wifi_pass[64] = DEFAULT_WIFI_PASS;
 char cellular_apn[64] = CELLULAR_APN;
 char pri_broker_uri[128] = MQTT_BROKER_URI;
 char sec_broker_uri[128] = SEC_BROKER_URI;
+
+// Time server tried first (the on-site laptop running chrony); pool.ntp.org is
+// always the second server, so a laptop that is off or out of reach (cellular)
+// only costs precision. Portal field "ntp_srv" overrides the default.
+#ifndef NTP_SERVER_LOCAL
+#define NTP_SERVER_LOCAL ""            // older credentials.h: pool.ntp.org only
+#endif
+const char ntp_server_default[] = NTP_SERVER_LOCAL;   // shown by the captive portal
+char ntp_server[64] = NTP_SERVER_LOCAL;
+#define SNTP_SYNC_INTERVAL_MS 60000    // ESP32 crystal drifts ~40-70 ms/h; re-sync every minute
 char tenant_id[32] = DEFAULT_TENANT_ID;
 
 // ==========================================
@@ -365,6 +376,13 @@ static cmd_msg_t cmd_staging;
 // TIMEKEEPING GLOBALS
 // ==========================================
 static volatile bool sntp_sync_pending = false;
+
+// Latency-test support. ts_ms is only meaningful once SNTP has set the clock this
+// boot (the DS3231 counts whole seconds), so it is sent only after the first
+// sync; sync_age_s tells the analysis how fresh that sync was. Both written in
+// the SNTP callback, read by the telemetry publisher (32-bit, so no tearing).
+static volatile bool     sntp_ever_synced = false;
+static volatile uint32_t sntp_last_sync_s = 0;     // uptime (s) of the last SNTP sync
 
 // Set when the clock was seeded from a DS3231 whose oscillator had stopped
 // (OSF=1): the time is usable but may be behind (seen: 87 min). Until SNTP
@@ -695,6 +713,14 @@ static void seed_system_time_from_ds3231(bool at_boot) {
 static void on_sntp_sync(struct timeval *tv) {
     (void)tv;
     clock_provisional = false;   // SNTP has already set the real time
+    sntp_last_sync_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    if (!sntp_ever_synced) {
+        // First sync steps the clock (it may be off by seconds after an RTC seed).
+        // Later 60 s re-syncs slew it gradually, so a re-sync during a latency
+        // test cannot put a jump into the ts_ms series.
+        sntp_ever_synced = true;
+        esp_sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
+    }
     sntp_sync_pending = true;
 }
 
@@ -703,19 +729,31 @@ void time_sync_task(void *pvParameter) {
     TickType_t last_sntp_tick = 0;
     TickType_t last_reseed_tick = xTaskGetTickCount();
     TickType_t last_write_attempt = 0;
+    bool rtc_write_due = false;
+    bool rtc_written = false;
+    TickType_t last_rtc_write = 0;
 
     while (1) {
         TickType_t now_tick = xTaskGetTickCount();
 
-        // 1. SNTP delivered fresh time: persist it to the DS3231.
-        if (sntp_sync_pending && !safe_eject_active &&
+        // 1. SNTP delivered fresh time. SNTP now syncs every 60 s; the DS3231
+        //    only needs refreshing hourly (it drifts ~2 ppm), not every minute.
+        if (sntp_sync_pending) {
+            sntp_sync_pending = false;
+            have_sntp = true;
+            last_sntp_tick = now_tick;
+            if (!rtc_written || (now_tick - last_rtc_write) > LONG_MS_TO_TICKS(RTC_RESEED_INTERVAL_MS)) {
+                rtc_write_due = true;
+            }
+        }
+        if (rtc_write_due && !safe_eject_active &&
             (now_tick - last_write_attempt) >= pdMS_TO_TICKS(RTC_WRITE_RETRY_MS)) {
             last_write_attempt = now_tick;
             time_t now = time(NULL);
             if (now >= MIN_VALID_EPOCH && ds3231_write_epoch(now)) {
-                sntp_sync_pending = false;
-                have_sntp = true;
-                last_sntp_tick = now_tick;
+                rtc_write_due = false;
+                rtc_written = true;
+                last_rtc_write = now_tick;
                 char iso[32];
                 struct tm t; gmtime_r(&now, &t);
                 strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%SZ", &t);
@@ -757,7 +795,7 @@ static void send_command_ack(const char *cid, const char *action, const char *st
     cJSON_AddStringToObject(ack_root, "action", action ? action : "unknown");
     cJSON_AddStringToObject(ack_root, "status", status);
     cJSON_AddStringToObject(ack_root, "details", details ? details : "");
-    cJSON_AddNumberToObject(ack_root, "ts", (double)node_epoch());
+    if (clock_trusted()) cJSON_AddNumberToObject(ack_root, "ts", (double)node_epoch());   // omitted, not faked, before the clock is set
 
     char *payload = cJSON_PrintUnformatted(ack_root);
     if (payload != NULL) {
@@ -1773,7 +1811,12 @@ static void publish_node_config(void) {
     cJSON_AddStringToObject(root, "active_hw_mode", mode == 0 ? "WIFI" : "CELLULAR");
     cJSON_AddStringToObject(root, "wifi_ssid", saved_ssid);
     cJSON_AddStringToObject(root, "cell_apn", saved_apn);
-    cJSON_AddStringToObject(root, "target_broker", saved_uri);
+    // target_broker = the broker this connection actually uses; edge_broker = the
+    // portal's fallback. (target_broker used to always show the edge broker.)
+    cJSON_AddStringToObject(root, "target_broker",
+                            current_route_state == ROUTE_CLOUD ? pri_broker_uri : sec_broker_uri);
+    cJSON_AddStringToObject(root, "edge_broker", saved_uri);
+    cJSON_AddStringToObject(root, "ntp_server", ntp_server[0] ? ntp_server : "pool.ntp.org");
     // Why this boot started, and where the previous one was when it ended, so the
     // dashboard can show unexpected restarts without a serial cable attached.
     cJSON_AddStringToObject(root, "last_reset", prev_reset_reason);
@@ -1782,7 +1825,7 @@ static void publish_node_config(void) {
         cJSON_AddStringToObject(root, "last_task", prev_last_task);
         cJSON_AddNumberToObject(root, "prev_uptime_s", prev_uptime_s);
     }
-    cJSON_AddNumberToObject(root, "ts", (double)node_epoch());
+    if (clock_trusted()) cJSON_AddNumberToObject(root, "ts", (double)node_epoch());
 
     char *payload = cJSON_PrintUnformatted(root);
     if (payload != NULL) {
@@ -2110,22 +2153,56 @@ void cellular_task(void *pvParameter) {
 // ==========================================
 // TELEMETRY PUBLISHER
 // ==========================================
-// Separate from the builder because esp_mqtt_client_enqueue() waits for the
-// MQTT client's internal lock, and the MQTT task holds that lock for the whole
-// network timeout while a write to a dead link stalls. In the field that froze
-// the builder for 112 s: those rows were neither sent nor spooled.
+// Separate from the builder because publishing waits for the MQTT client's
+// internal lock, and the MQTT task holds that lock for the whole network timeout
+// while a write to a dead link stalls. In the field that froze the builder for
+// 112 s: those rows were neither sent nor spooled. The builder never waits on
+// this task (full queue -> spool), so blocking here is harmless.
+//
+// publish(), not enqueue(): enqueue() leaves the row in the outbox until the
+// MQTT task next wakes, which is up to 1 s later (its poll timeout). That delay
+// would land in every latency sample. publish() writes to the socket now, so
+// ts_ms, stamped just before it, is the real send time.
+//
+// The latency fields (ts_ms, sync_age_s, rt) describe THIS send, so they are
+// removed again before a row goes to the spool; replayed rows never carry them.
+static void add_send_fields(cJSON *root) {
+    cJSON_AddStringToObject(root, "rt", current_route_state == ROUTE_CLOUD ? "cloud" : "edge");
+    if (!sntp_ever_synced) return;                     // RTC-only clock: whole seconds, no ts_ms
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int64_t ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    cJSON_AddNumberToObject(root, "ts_ms", (double)ms);
+    cJSON_AddNumberToObject(root, "sync_age_s",
+                            (double)((uint32_t)(esp_timer_get_time() / 1000000) - sntp_last_sync_s));
+}
+
 void telemetry_publisher_task(void *pvParameter) {
-    char *s;
+    cJSON *root;
     while (1) {
-        if (xQueueReceive(tlm_out_queue, &s, portMAX_DELAY) != pdTRUE) continue;
+        if (xQueueReceive(tlm_out_queue, &root, portMAX_DELAY) != pdTRUE) continue;
         crumb("tlm: publish");
-        if (is_mqtt_connected && mqtt_client != NULL &&
-            esp_mqtt_client_enqueue(mqtt_client, topic_tlm, s, 0, 1, 0, true) >= 0) {
-            ESP_LOGI(TAG, "Live Payload Dispatched -> %s", s);
-        } else {
-            spool_append_line(s);   // only queued with a valid clock, so no re-time fields needed
+        bool sent = false;
+        if (is_mqtt_connected && mqtt_client != NULL) {
+            add_send_fields(root);
+            char *s = cJSON_PrintUnformatted(root);
+            if (s != NULL) {
+                sent = esp_mqtt_client_publish(mqtt_client, topic_tlm, s, 0, 1, 0) >= 0;
+                if (sent) ESP_LOGI(TAG, "Live Payload Dispatched -> %s", s);
+                free(s);
+            }
         }
-        free(s);
+        if (!sent) {
+            cJSON_DeleteItemFromObject(root, "rt");
+            cJSON_DeleteItemFromObject(root, "ts_ms");
+            cJSON_DeleteItemFromObject(root, "sync_age_s");
+            char *s = cJSON_PrintUnformatted(root);
+            if (s != NULL) {
+                spool_append_line(s);   // only queued with a valid clock, so no re-time fields needed
+                free(s);
+            }
+        }
+        cJSON_Delete(root);
     }
 }
 
@@ -2173,18 +2250,17 @@ void telemetry_builder_task(void *pvParameter) {
         if (is_mqtt_connected && mqtt_client != NULL && clock_trusted()) {
             // Hand the row to telemetry_publisher_task and never wait for it: if
             // the publisher is stuck behind a stalled MQTT write, the row goes to
-            // flash instead of being lost.
-            char *payload_string = cJSON_PrintUnformatted(root);
-            if (payload_string != NULL && xQueueSend(tlm_out_queue, &payload_string, 0) != pdTRUE) {
-                free(payload_string);
+            // flash instead of being lost. On success the publisher owns root.
+            if (xQueueSend(tlm_out_queue, &root, 0) != pdTRUE) {
                 ESP_LOGW(TAG, "MQTT link stalled; spooling telemetry.");
                 spool_telemetry_root(root);
+                cJSON_Delete(root);
             }
         } else {
             // Spool in BOTH modes: Wi-Fi can lose the cloud AND the edge broker at once.
             spool_telemetry_root(root);
+            cJSON_Delete(root);
         }
-        cJSON_Delete(root);
 
         if (++cycle % HEALTH_LOG_EVERY_N_CYCLES == 0) {
             ESP_LOGI(TAG, "Health: heap=%" PRIu32 " min_heap=%" PRIu32 " outbox=%d route=%s mqtt=%d chips=%d",
@@ -2293,7 +2369,7 @@ void discovery_builder_task(void *pvParameter) {
         cJSON_AddStringToObject(root, "tid", tenant_id);
         cJSON_AddStringToObject(root, "nid", node_id);
         cJSON_AddStringToObject(root, "net", (current_hw_mode == HW_MODE_CELLULAR) ? "cell" : "wifi");
-        cJSON_AddNumberToObject(root, "ts", (double)node_epoch());
+        if (clock_trusted()) cJSON_AddNumberToObject(root, "ts", (double)node_epoch());
         cJSON_AddNumberToObject(root, "tlm_interval_ms", TELEMETRY_INTERVAL_MS);
 
         cJSON *bus_array = cJSON_AddArrayToObject(root, "buses");
@@ -2655,6 +2731,7 @@ void app_main(void) {
         len = sizeof(cellular_apn);   nvs_get_str(h, "cell_apn", cellular_apn, &len);
         len = sizeof(sec_broker_uri); nvs_get_str(h, "sec_uri", sec_broker_uri, &len);
         len = sizeof(tenant_id);      nvs_get_str(h, "tenant_id", tenant_id, &len);
+        len = sizeof(ntp_server);     nvs_get_str(h, "ntp_srv", ntp_server, &len);
         uint8_t mode = 0;
         if (nvs_get_u8(h, "hw_mode", &mode) == ESP_OK) current_hw_mode = (HardwareConfig_t)mode;
         nvs_close(h);
@@ -2712,7 +2789,7 @@ void app_main(void) {
     s_hardware_event_group = xEventGroupCreate();
 
     command_queue = xQueueCreate(CMD_QUEUE_DEPTH, sizeof(cmd_msg_t));
-    tlm_out_queue = xQueueCreate(TLM_OUT_QUEUE_DEPTH, sizeof(char *));
+    tlm_out_queue = xQueueCreate(TLM_OUT_QUEUE_DEPTH, sizeof(cJSON *));
     spool_mutex    = xSemaphoreCreateMutex();
     mqtt_cfg_mutex = xSemaphoreCreateMutex();
     if (command_queue == NULL) ESP_LOGE(TAG, "Failed to allocate command queue; C2 unavailable.");
@@ -2742,11 +2819,31 @@ void app_main(void) {
         ESP_LOGE(TAG, "Failed to initialise the I2C master peripheral.");
     }
 
-    // SNTP: polls pool.ntp.org whenever any netif (Wi-Fi or PPP) has a route.
-    // The callback only sets a flag; time_sync_task writes the DS3231.
+    // SNTP: polls whenever any netif (Wi-Fi or PPP) has a route. Server 1 is the
+    // on-site time server (laptop), server 2 pool.ntp.org; lwIP moves to the next
+    // server when one stops answering. The callback only sets flags;
+    // time_sync_task writes the DS3231.
     esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+#if CONFIG_LWIP_SNTP_MAX_SERVERS >= 2
+    if (ntp_server[0] != '\0') {
+        sntp_cfg.num_of_servers = 2;
+        sntp_cfg.servers[0] = ntp_server;
+        sntp_cfg.servers[1] = "pool.ntp.org";
+    }
+#else
+    // ESP-IDF builds with -Werror, so this is a runtime warning, not #warning.
+    if (ntp_server[0] != '\0') {
+        ESP_LOGW(TAG, "Time server %s ignored: LWIP_SNTP_MAX_SERVERS is 1. "
+                      "Set it to 2 in menuconfig (Component config > LWIP > SNTP).", ntp_server);
+    }
+#endif
     sntp_cfg.sync_cb = on_sntp_sync;
+    esp_sntp_set_sync_interval(SNTP_SYNC_INTERVAL_MS);
     esp_netif_sntp_init(&sntp_cfg);
+    ESP_LOGI(TAG, "SNTP servers: %s%s every %d s.",
+             (CONFIG_LWIP_SNTP_MAX_SERVERS >= 2 && ntp_server[0]) ? ntp_server : "",
+             (CONFIG_LWIP_SNTP_MAX_SERVERS >= 2 && ntp_server[0]) ? " then pool.ntp.org," : "pool.ntp.org,",
+             SNTP_SYNC_INTERVAL_MS / 1000);
 
     // Let the A7670C power surge and the LLC settle before the first scan
     vTaskDelay(pdMS_TO_TICKS(2000));

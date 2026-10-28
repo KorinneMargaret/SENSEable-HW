@@ -17,6 +17,7 @@
 static httpd_handle_t portal_server = NULL;
 
 extern char node_id[32]; // Access the globally generated Node ID
+extern const char ntp_server_default[]; // NTP_SERVER_LOCAL from credentials.h (main file)
 
 static const char *HTML_CONFIG_PAGE =
 "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -70,6 +71,8 @@ static const char *HTML_CONFIG_PAGE =
 
 "<label>Edge Broker URI (Mosquitto)</label>"
 "<input type=\"text\" name=\"sec_uri\" placeholder=\"mqtts://...\" value=\"%s\" required>"
+"<label>Time Server <span style=\"font-weight:normal;color:#718096;\">(laptop IP; blank = %s)</span></label>"
+"<input type=\"text\" name=\"ntp_srv\" maxlength=\"63\" pattern=\"^[A-Za-z0-9.\\-]*$\" title=\"IP address or host name\" placeholder=\"%s\" value=\"%s\">"
 "<label>Tenant ID</label>"
 "<input type=\"text\" name=\"tenant_id\" pattern=\"^[a-z0-9]{2,12}-[a-f0-9]{4}$\" title=\"Must be in format e.g. llda-add4\" placeholder=\"e.g. llda-add4\" value=\"%s\" required>"
 
@@ -150,6 +153,7 @@ static esp_err_t get_root_handler(httpd_req_t *req) {
     char saved_apn[64] = "internet.globe.com.ph"; // Fallback placeholder
     char saved_uri[128] = "";
     char saved_tenant[32] = "";
+    char saved_ntp[64] = "";
 
     // Fetch existing configurations
     if (nvs_open("senseable", NVS_READONLY, &h) == ESP_OK) {
@@ -160,24 +164,30 @@ static esp_err_t get_root_handler(httpd_req_t *req) {
         len = sizeof(saved_apn); nvs_get_str(h, "cell_apn", saved_apn, &len);
         len = sizeof(saved_uri); nvs_get_str(h, "sec_uri", saved_uri, &len);
         len = sizeof(saved_tenant); nvs_get_str(h, "tenant_id", saved_tenant, &len);
+        len = sizeof(saved_ntp); nvs_get_str(h, "ntp_srv", saved_ntp, &len);
         
         nvs_close(h);
     }
 
-    // Allocate 4KB string buffer on the heap for the dynamic HTML
-    char *resp_str = malloc(4096);
+    // Heap buffer for the dynamic HTML (page ~3.3 KB + field values)
+    char *resp_str = malloc(6144);
     if (!resp_str) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
     // Inject data into HTML variables
-    snprintf(resp_str, 4096, HTML_CONFIG_PAGE,
+    // Shown in the field: the saved server, else the built-in default
+    const char *ntp_shown = saved_ntp[0] ? saved_ntp : ntp_server_default;
+    const char *ntp_blank = ntp_server_default[0] ? ntp_server_default : "pool.ntp.org only";
+
+    snprintf(resp_str, 6144, HTML_CONFIG_PAGE,
              mode == 0 ? "checked" : "",   
              mode == 1 ? "checked" : "",   
              saved_ssid,
              saved_apn,
              saved_uri,
+             ntp_blank, ntp_blank, ntp_shown,
              saved_tenant);
 
     httpd_resp_set_type(req, "text/html");
@@ -194,7 +204,7 @@ static esp_err_t captive_redirect_handler(httpd_req_t *req) {
 }
 
 static esp_err_t post_save_handler(httpd_req_t *req) {
-    char buf[512];
+    char buf[768];
     int ret, remaining = req->content_len;
     if (remaining >= sizeof(buf)) { httpd_resp_send_500(req); return ESP_FAIL; }
     ret = httpd_req_recv(req, buf, remaining);
@@ -203,6 +213,8 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
 
     char raw_val[128];
     char clean_ssid[64] = {0}, clean_pass[64] = {0}, clean_sec_uri[128] = {0}, clean_tenant[32] = {0}, clean_apn[64] = {0};
+    char clean_ntp[64] = {0};
+    bool ntp_field_sent = false;
     uint8_t mode_val = 0;
 
     if (httpd_query_key_value(buf, "hw_mode", raw_val, sizeof(raw_val)) == ESP_OK) mode_val = (uint8_t)atoi(raw_val);
@@ -211,6 +223,25 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
     if (httpd_query_key_value(buf, "apn", raw_val, sizeof(raw_val)) == ESP_OK) url_decode(clean_apn, raw_val, sizeof(clean_apn));
     if (httpd_query_key_value(buf, "sec_uri", raw_val, sizeof(raw_val)) == ESP_OK) url_decode(clean_sec_uri, raw_val, sizeof(clean_sec_uri));
     if (httpd_query_key_value(buf, "tenant_id", raw_val, sizeof(raw_val)) == ESP_OK) url_decode(clean_tenant, raw_val, sizeof(clean_tenant));
+    if (httpd_query_key_value(buf, "ntp_srv", raw_val, sizeof(raw_val)) == ESP_OK) {
+        ntp_field_sent = true;
+        url_decode(clean_ntp, raw_val, sizeof(clean_ntp));
+    }
+
+    // --- Time server: host name or IP only (letters, digits, '.', '-') ---
+    {
+        char *p = clean_ntp;
+        while (isspace((unsigned char)*p)) p++;
+        memmove(clean_ntp, p, strlen(p) + 1);
+        size_t n = strlen(clean_ntp);
+        while (n > 0 && isspace((unsigned char)clean_ntp[n - 1])) clean_ntp[--n] = '\0';
+        for (size_t i = 0; i < n; i++) {
+            if (!isalnum((unsigned char)clean_ntp[i]) && clean_ntp[i] != '.' && clean_ntp[i] != '-') {
+                clean_ntp[0] = '\0';      // reject, keep the default
+                break;
+            }
+        }
+    }
 
     // --- C-Level Sanitization for Tenant ID ---
     if (strlen(clean_tenant) > 0) {
@@ -248,6 +279,9 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
         if (strlen(clean_apn) > 0) nvs_set_str(h, "cell_apn", clean_apn);
         if (strlen(clean_sec_uri) > 0) nvs_set_str(h, "sec_uri", clean_sec_uri);
         if (strlen(clean_tenant) > 0) nvs_set_str(h, "tenant_id", clean_tenant);
+        // Blank (or rejected) time server = erase it, so the default applies.
+        if (strlen(clean_ntp) > 0)  nvs_set_str(h, "ntp_srv", clean_ntp);
+        else if (ntp_field_sent)    nvs_erase_key(h, "ntp_srv");
         
         nvs_commit(h); 
         
