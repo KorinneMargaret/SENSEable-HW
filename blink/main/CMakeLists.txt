@@ -13,4 +13,5 @@ idf_component_register(SRCS "blink_example_main.c" "captive_portal.c"
                                      cjson
                                      lwip
                                      esp_modem
-                                     littlefs)
+                                     littlefs
+                                    espcoredump)

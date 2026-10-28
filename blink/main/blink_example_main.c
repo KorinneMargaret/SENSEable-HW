@@ -39,6 +39,7 @@
 #include "freertos/event_groups.h"
 
 #include "esp_system.h"
+#include "esp_attr.h"      // RTC_NOINIT_ATTR (breadcrumbs)
 #include "esp_mac.h"
 #include "esp_rom_sys.h"
 #include "esp_random.h"
@@ -451,6 +452,104 @@ static void build_mqtt_topics(void) {
 }
 
 // ==========================================
+// BREADCRUMBS (survive watchdog / panic resets)
+// ==========================================
+// The last CRUMB_N steps the firmware reached, kept in RTC memory, which a
+// watchdog or panic reset does not clear (only a full power loss does). When a
+// crash is so bad that the panic handler cannot print, the next boot still
+// prints where each task last was. Repeats of the same step are not re-logged,
+// so a busy loop cannot flush out the other tasks' entries.
+// ponytail: unlocked on purpose (callable anywhere, can't deadlock a dying system);
+// a rare torn entry only garbles one diagnostic line. Add a spinlock if that matters.
+#define CRUMB_N      12
+#define CRUMB_MAGIC  0xC0FFEE42u
+typedef struct { uint32_t ms; char task[12]; char step[40]; } crumb_t;
+typedef struct { uint32_t magic; uint32_t next; crumb_t e[CRUMB_N]; } crumb_ring_t;
+static RTC_NOINIT_ATTR crumb_ring_t s_crumbs;
+
+static char prev_reset_reason[24] = "unknown";
+static char prev_last_step[40]    = "";
+static char prev_last_task[12]    = "";
+static double prev_uptime_s       = -1;
+
+static void crumb(const char *step) {
+    if (s_crumbs.magic != CRUMB_MAGIC) return;   // ring not initialised yet
+    uint32_t last = s_crumbs.next;
+    const char *task = pcTaskGetName(NULL);
+    // A periodic step (probe pass, ADS read, telemetry) already among the last
+    // few entries is only re-timed, so it cannot flush out rarer steps.
+    for (uint32_t k = 1; k <= 4 && k <= last; k++) {
+        crumb_t *p = &s_crumbs.e[(last - k) % CRUMB_N];
+        if (strncmp(p->step, step, sizeof(p->step) - 1) == 0 && strncmp(p->task, task ? task : "?", sizeof(p->task) - 1) == 0) {
+            p->ms = (uint32_t)(esp_timer_get_time() / 1000);
+            return;
+        }
+    }
+    uint32_t i = __atomic_fetch_add(&s_crumbs.next, 1, __ATOMIC_RELAXED) % CRUMB_N;
+    crumb_t *c = &s_crumbs.e[i];
+    c->ms = (uint32_t)(esp_timer_get_time() / 1000);
+    snprintf(c->task, sizeof(c->task), "%s", task ? task : "?");
+    snprintf(c->step, sizeof(c->step), "%s", step);
+}
+
+static const char *reset_reason_name(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "power_on";
+        case ESP_RST_EXT:       return "reset_pin";
+        case ESP_RST_SW:        return "software";
+        case ESP_RST_PANIC:     return "panic";
+        case ESP_RST_INT_WDT:   return "interrupt_watchdog";
+        case ESP_RST_TASK_WDT:  return "task_watchdog";
+        case ESP_RST_WDT:       return "watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep_sleep";
+        case ESP_RST_BROWNOUT:  return "brownout";
+        default:                return "other";
+    }
+}
+
+// First thing in app_main: report how the previous boot ended, then start a new ring.
+static void report_previous_boot(void) {
+    esp_reset_reason_t r = esp_reset_reason();
+    snprintf(prev_reset_reason, sizeof(prev_reset_reason), "%s", reset_reason_name(r));
+
+    bool have_trail = (r != ESP_RST_POWERON && s_crumbs.magic == CRUMB_MAGIC && s_crumbs.next > 0);
+    if (have_trail) {
+        uint32_t n = s_crumbs.next < CRUMB_N ? s_crumbs.next : CRUMB_N;
+        crumb_t *last;
+        // Entries are re-timed in place, so the most recent step is the one with
+        // the latest time, not necessarily the last slot written.
+        uint32_t order[CRUMB_N];
+        for (uint32_t k = 0; k < n; k++) order[k] = (s_crumbs.next - n + k) % CRUMB_N;
+        for (uint32_t a = 1; a < n; a++)                       // insertion sort by time
+            for (uint32_t b = a; b > 0 && s_crumbs.e[order[b - 1]].ms > s_crumbs.e[order[b]].ms; b--) {
+                uint32_t t = order[b]; order[b] = order[b - 1]; order[b - 1] = t;
+            }
+        last = &s_crumbs.e[order[n - 1]];
+        last->task[sizeof(last->task) - 1] = '\0';
+        last->step[sizeof(last->step) - 1] = '\0';
+        snprintf(prev_last_step, sizeof(prev_last_step), "%s", last->step);
+        snprintf(prev_last_task, sizeof(prev_last_task), "%s", last->task);
+        prev_uptime_s = last->ms / 1000.0;   // closest thing to "uptime at the crash"
+
+        ESP_LOGW(TAG, "Previous boot ended by: %s at ~%.1f s. Last step: [%s] %s",
+                 prev_reset_reason, prev_uptime_s, prev_last_task, prev_last_step);
+        ESP_LOGW(TAG, "Last %u steps before the reset (oldest first):", (unsigned)n);
+        for (uint32_t k = 0; k < n; k++) {
+            crumb_t *c = &s_crumbs.e[order[k]];
+            c->task[sizeof(c->task) - 1] = '\0';
+            c->step[sizeof(c->step) - 1] = '\0';
+            ESP_LOGW(TAG, "  %8.3f s  %-11s %s", c->ms / 1000.0, c->task, c->step);
+        }
+    } else {
+        ESP_LOGI(TAG, "Previous boot ended by: %s", prev_reset_reason);
+    }
+
+    memset(&s_crumbs, 0, sizeof(s_crumbs));
+    s_crumbs.magic = CRUMB_MAGIC;
+    crumb("boot");
+}
+
+// ==========================================
 // TIMEKEEPING (DS3231 + SNTP)
 // ==========================================
 // Payload timestamps come from the system clock. The system clock is seeded
@@ -518,6 +617,7 @@ static time_t ds3231_read_epoch(bool *osf_set) {
 }
 
 static bool ds3231_write_epoch(time_t now) {
+    crumb("rtc: write time");
     if (ds3231_handle == NULL) return false;
 
     struct tm t;
@@ -811,6 +911,7 @@ static void spool_append_line(const char *payload) {
         ESP_LOGE(TAG, "Spool reached %d bytes. Wiping backlog to protect flash.", SPOOL_MAX_BYTES);
         remove(SPOOL_FILE_PATH);
     }
+    crumb("spool: flash append");
     FILE *f = fopen(SPOOL_FILE_PATH, "a");
     bool ok = false;
     if (f != NULL) {
@@ -900,6 +1001,7 @@ static void recover_i2c_bus(void) {
 
     if (xSemaphoreTake(i2c_mutex, portMAX_DELAY) == pdTRUE) {
         // 1. Tear down ESP-IDF handles
+        crumb("i2c recovery: teardown");
         for (int i = 0; i < 4; i++) {
             if (ads_handles[i] != NULL) { i2c_master_bus_rm_device(ads_handles[i]); ads_handles[i] = NULL; }
         }
@@ -907,6 +1009,7 @@ static void recover_i2c_bus(void) {
         if (bus_handle != NULL) { i2c_del_master_bus(bus_handle); bus_handle = NULL; }
 
         // 2. Cycle the hardware gate (no-op if the TCA4307 is bypassed)
+        crumb("i2c recovery: gate cycle");
         ESP_LOGW(TAG, "Cycling bus gate EN (GPIO %d) LOW -> HIGH...", TCA4307_EN_GPIO);
         gpio_set_level(TCA4307_EN_GPIO, 0);
         vTaskDelay(pdMS_TO_TICKS(25));
@@ -914,9 +1017,11 @@ static void recover_i2c_bus(void) {
         vTaskDelay(pdMS_TO_TICKS(25));
 
         // 3. Release any slave holding SDA low
+        crumb("i2c recovery: bus clear");
         i2c_bus_clear();
 
         // 4. Re-initialise the master and restore the RTC
+        crumb("i2c recovery: driver re-init");
         if (i2c_master_init() == ESP_OK) {
             i2c_device_config_t ds_cfg = {
                 .dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -925,6 +1030,7 @@ static void recover_i2c_bus(void) {
             };
             i2c_master_bus_add_device(bus_handle, &ds_cfg, &ds3231_handle);
             ESP_LOGI(TAG, "I2C master, bus gate and RTC restored.");
+            crumb("i2c recovery: done");
         } else {
             ESP_LOGE(TAG, "Fatal fault re-instantiating the I2C master bus.");
         }
@@ -963,6 +1069,7 @@ static esp_err_t probe_addr(uint16_t addr) {
 }
 
 static int perform_i2c_probe_pass(bool *rtc_ok) {
+    crumb("i2c probe pass");
     *rtc_ok = false;
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(200)) != pdTRUE) return -1;
 
@@ -1073,6 +1180,7 @@ static void scan_i2c_bus(void) {
 // SAFE EJECT SLIDE SWITCH
 // ==========================================
 static void apply_safe_eject(bool active) {
+    crumb(active ? "safe eject: on" : "safe eject: off");
     if (active) {
         // Wait for any in-flight transaction to finish before dropping the gate.
         // Gating mid-transaction would leave a slave holding SDA low.
@@ -1177,6 +1285,7 @@ void ads_reader_task(void *pvParameter) {
 
         for (int i = 0; i < 4; i++) {
             if (ads_handles[i] == NULL || !global_node_data[i].is_online) continue;
+            crumb("ads read");
 
             for (int channel = 0; channel < 4; channel++) {
                 if (!port_active[i][channel]) continue;
@@ -1338,6 +1447,7 @@ static void process_incoming_command(const char *json_string, size_t length) {
         return;
     }
     const char *action = act_item->valuestring;
+    { char cb[40]; snprintf(cb, sizeof(cb), "cmd: %s", action); crumb(cb); }
 
     // 3. Tenant / node binding. A command naming a different tenant or node is
     //    never executed and never ACKed (an ACK would publish to OUR tenant's
@@ -1582,6 +1692,14 @@ static void publish_node_config(void) {
     cJSON_AddStringToObject(root, "wifi_ssid", saved_ssid);
     cJSON_AddStringToObject(root, "cell_apn", saved_apn);
     cJSON_AddStringToObject(root, "target_broker", saved_uri);
+    // Why this boot started, and where the previous one was when it ended, so the
+    // dashboard can show unexpected restarts without a serial cable attached.
+    cJSON_AddStringToObject(root, "last_reset", prev_reset_reason);
+    if (prev_last_step[0] != '\0') {
+        cJSON_AddStringToObject(root, "last_step", prev_last_step);
+        cJSON_AddStringToObject(root, "last_task", prev_last_task);
+        cJSON_AddNumberToObject(root, "prev_uptime_s", prev_uptime_s);
+    }
     cJSON_AddNumberToObject(root, "ts", (double)node_epoch());
 
     char *payload = cJSON_PrintUnformatted(root);
@@ -1670,6 +1788,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
 static void configure_mqtt_client(void) {
     xSemaphoreTake(mqtt_cfg_mutex, portMAX_DELAY);
+    crumb(current_route_state == ROUTE_CLOUD ? "mqtt: configure cloud" : "mqtt: configure edge");
 
     esp_mqtt_client_config_t mqtt_cfg = {0};
     mqtt_cfg.network.timeout_ms = MQTT_NETWORK_TIMEOUT_MS;
@@ -1761,6 +1880,7 @@ void cloud_watchdog_task(void *pvParameter) {
         if (trigger_failover) {
             trigger_failover = false;
             ESP_LOGW(TAG, "Executing Phase 2: Local Edge Server Routing...");
+            crumb("failover: to edge");
             current_route_state = ROUTE_LOCAL;
             configure_mqtt_client();
         }
@@ -1769,6 +1889,7 @@ void cloud_watchdog_task(void *pvParameter) {
             if ((xTaskGetTickCount() - last_cloud_ping) > pdMS_TO_TICKS(WIFI_WAN_PROBE_INTERVAL_MS)) {
                 last_cloud_ping = xTaskGetTickCount();
                 ESP_LOGI(TAG, "Watchdog probing WAN connectivity...");
+                crumb("wan probe");
                 if (is_internet_available()) {
                     ESP_LOGI(TAG, "Internet restored! Returning to Cloud Phase 1...");
                     current_route_state = ROUTE_CLOUD;
@@ -1915,6 +2036,7 @@ void telemetry_publisher_task(void *pvParameter) {
     char *s;
     while (1) {
         if (xQueueReceive(tlm_out_queue, &s, portMAX_DELAY) != pdTRUE) continue;
+        crumb("tlm: publish");
         if (is_mqtt_connected && mqtt_client != NULL &&
             esp_mqtt_client_enqueue(mqtt_client, topic_tlm, s, 0, 1, 0, true) >= 0) {
             ESP_LOGI(TAG, "Live Payload Dispatched -> %s", s);
@@ -2288,6 +2410,7 @@ void backlog_replay_task(void *pvParameter) {
                     // publish() (blocking) is deliberate here: this is a dedicated
                     // task, and pacing one-at-a-time keeps a large backlog out of
                     // the MQTT outbox's RAM.
+                    crumb("replay: publish row");
                     int msg_id = esp_mqtt_client_publish(mqtt_client, row_topic, replay_payload, 0, 1, 0);
                     free(replay_payload);
                     if (msg_id < 0) { replay_complete = false; break; }
@@ -2327,11 +2450,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "Wi-Fi disconnected. Retrying...");
+        crumb("wifi: disconnected");
         xEventGroupClearBits(s_network_event_group, MQTT_CONNECTED_BIT);
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Wi-Fi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        crumb("wifi: got ip");
         if (current_route_state == ROUTE_LOCAL && is_internet_available()) {
             ESP_LOGI(TAG, "Internet verified on new IP lease. Switching to Cloud Phase 1...");
             current_route_state = ROUTE_CLOUD;
@@ -2366,6 +2491,8 @@ static void wifi_init_sta(void) {
 // APPLICATION MAIN
 // ==========================================
 void app_main(void) {
+    report_previous_boot();
+    crumb("boot: nvs init");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -2390,6 +2517,7 @@ void app_main(void) {
     setenv("TZ", "UTC0", 1);
     tzset();
 
+    crumb("boot: littlefs mount");
     init_littlefs();
     init_dynamic_identity();
     init_system_leds();
@@ -2405,6 +2533,7 @@ void app_main(void) {
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE
     };
+    crumb("boot: provisioning switch");
     gpio_config(&switch_cfg);
     vTaskDelay(pdMS_TO_TICKS(10));
 
@@ -2426,6 +2555,7 @@ void app_main(void) {
         ESP_LOGW(TAG, " CONFIG MODE TRIGGERED (SLIDE SWITCH GND)      ");
         ESP_LOGW(TAG, " Broadcasting SoftAP Captive Portal...         ");
         ESP_LOGW(TAG, "===============================================");
+        crumb("boot: provisioning portal");
         wifi_init_softap();
         xTaskCreate(dns_server_task, "dns_task", 3072, NULL, 5, NULL);
         start_captive_web_server();
@@ -2434,6 +2564,7 @@ void app_main(void) {
 
     // NORMAL RUN MODE
     ESP_LOGI(TAG, "RUN MODE DETECTED. Loading NVS configuration...");
+    crumb("boot: run mode, nvs config");
     nvs_handle_t h;
     if (nvs_open("senseable", NVS_READONLY, &h) == ESP_OK) {
         size_t len;
@@ -2509,6 +2640,7 @@ void app_main(void) {
     // A battery-backed DS3231 keeps its I2C state across an ESP32 reset. If the
     // reset landed mid-read, it is still holding SDA low: free it before the
     // first transaction, or the boot-time clock seed fails.
+    crumb("boot: i2c init");
     i2c_bus_clear();
 
     if (i2c_master_init() == ESP_OK) {
@@ -2519,6 +2651,7 @@ void app_main(void) {
         };
         i2c_master_bus_add_device(bus_handle, &ds_cfg, &ds3231_handle);
         ESP_LOGI(TAG, "DS3231 RTC mapped to master bus.");
+        crumb("boot: rtc seed");
         seed_system_time_from_ds3231(true);
     } else {
         ESP_LOGE(TAG, "Failed to initialise the I2C master peripheral.");
@@ -2532,7 +2665,9 @@ void app_main(void) {
 
     // Let the A7670C power surge and the LLC settle before the first scan
     vTaskDelay(pdMS_TO_TICKS(2000));
+    crumb("boot: first i2c scan");
     scan_i2c_bus();
+    crumb("boot: starting tasks");
 
     xTaskCreate(network_led_task,       "led_worker",  2048, NULL, 2, NULL);
     xTaskCreate(eject_button_task,      "eject_btn",   3072, NULL, 5, NULL);
@@ -2549,6 +2684,7 @@ void app_main(void) {
         xTaskCreate(cellular_task, "cellular", 6144, NULL, 5, NULL);
     } else {
         ESP_LOGI(TAG, ">>> BOOTING WI-FI STATION <<<");
+        crumb("boot: wifi start");
         wifi_init_sta();
         xTaskCreate(cloud_watchdog_task, "cloud_wdog", 3072, NULL, 3, NULL);
     }
