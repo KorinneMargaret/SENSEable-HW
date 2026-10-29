@@ -138,7 +138,9 @@ static const char *TAG = "THESIS_NODE";
 // --- Offline spool ---
 #define SPOOL_FILE_PATH           "/fs/telemetry_spool.jsonl"
 #define SPOOL_REPLAY_PATH         SPOOL_FILE_PATH ".replaying"
+#define SPOOL_TRIM_PATH           SPOOL_FILE_PATH ".trim"
 #define SPOOL_MAX_BYTES           1000000
+#define SPOOL_MIN_LIVE_BYTES      100000   // new rows always get at least this much
 #define REPLAY_WAIT_FOR_TIME_MS   90000   // hold replay up to 90 s for SNTP so pre-sync rows can be re-timed
 
 // --- ADS1115 acquisition ---
@@ -226,6 +228,85 @@ typedef enum { ROUTE_CLOUD = 0, ROUTE_LOCAL = 1 } RoutingState_t;
 static HardwareConfig_t current_hw_mode = HW_MODE_WIFI;
 static RoutingState_t current_route_state = ROUTE_CLOUD;
 static int cloud_disconnect_count = 0;
+
+// ---- Why the node last lost its link (reported in the next config packet) ----
+// Down = from the first Wi-Fi or MQTT disconnect until MQTT is connected again.
+// Only the FIRST cause of an outage is kept: the Wi-Fi retries that follow a
+// lost access point (NO_AP_FOUND...) are consequences, not causes. An MQTT drop
+// followed within 30 s by a Wi-Fi drop is re-attributed to Wi-Fi (the radio
+// usually notices after the TCP session does).
+typedef struct {
+    bool     valid;
+    char     cause[8];       // "wifi" or "mqtt"
+    char     reason[40];     // e.g. "BEACON_TIMEOUT", "connection_lost"
+    int      reason_code;    // Wi-Fi reason code, 0 for mqtt
+    int64_t  at_epoch;       // wall-clock start of the outage, 0 if the clock wasn't set
+    uint32_t offline_s;
+    uint32_t rows_spooled;
+} link_event_t;
+static SemaphoreHandle_t link_mutex = NULL;
+static bool clock_trusted(void);
+static time_t node_epoch(void);
+static link_event_t link_down = {0};          // outage in progress
+static link_event_t last_disconnect = {0};    // last completed outage
+static volatile int64_t link_down_since_us = 0;
+static volatile uint32_t rows_spooled_while_down = 0;
+
+static const char *wifi_reason_name(int r) {
+    switch (r) {
+        case 2:   return "AUTH_EXPIRE";
+        case 3:   return "AUTH_LEAVE";
+        case 4:   return "ASSOC_EXPIRE";
+        case 8:   return "ASSOC_LEAVE";
+        case 15:  return "4WAY_HANDSHAKE_TIMEOUT";
+        case 200: return "BEACON_TIMEOUT";        // signal lost / AP gone
+        case 201: return "NO_AP_FOUND";           // AP off or out of range
+        case 202: return "AUTH_FAIL";             // wrong password
+        case 203: return "ASSOC_FAIL";
+        case 204: return "HANDSHAKE_TIMEOUT";     // often a wrong password too
+        case 205: return "CONNECTION_FAIL";
+        case 206: return "AP_TSF_RESET";
+        case 207: return "ROAMING";
+        default:  return "OTHER";
+    }
+}
+
+static void note_link_down(const char *cause, const char *reason, int code) {
+    if (link_mutex == NULL || xSemaphoreTake(link_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    int64_t now = esp_timer_get_time();
+    bool upgrade = link_down_since_us != 0 && strcmp(cause, "wifi") == 0 &&
+                   strcmp(link_down.cause, "mqtt") == 0 && (now - link_down_since_us) < 30000000LL;
+    if (link_down_since_us == 0 || upgrade) {
+        if (link_down_since_us == 0) {
+            link_down_since_us = now;
+            link_down.at_epoch = clock_trusted() ? (int64_t)node_epoch() : 0;
+        }
+        link_down.valid = true;
+        snprintf(link_down.cause, sizeof(link_down.cause), "%s", cause);
+        snprintf(link_down.reason, sizeof(link_down.reason), "%s", reason);
+        link_down.reason_code = code;
+    }
+    xSemaphoreGive(link_mutex);
+}
+
+// MQTT is connected again: close the outage record so the config packet can report it.
+static void note_link_up(void) {
+    if (link_mutex == NULL || xSemaphoreTake(link_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    if (link_down_since_us != 0) {
+        last_disconnect = link_down;
+        last_disconnect.offline_s = (uint32_t)((esp_timer_get_time() - link_down_since_us) / 1000000);
+        last_disconnect.rows_spooled = rows_spooled_while_down;
+        link_down_since_us = 0;
+        ESP_LOGW(TAG, "Link restored after %lu s offline (cause: %s, %s; %lu rows buffered).",
+                 (unsigned long)last_disconnect.offline_s, last_disconnect.cause, last_disconnect.reason,
+                 (unsigned long)last_disconnect.rows_spooled);
+    }
+    // Counted from one MQTT connect to the next, so rows spooled while a dying
+    // link stalled (before the disconnect was noticed) are included. Rows
+    // spooled before the first connect after boot are not an outage.
+    rows_spooled_while_down = 0;
+    xSemaphoreGive(link_mutex);
+}
 volatile bool is_mqtt_connected = false;
 volatile bool trigger_failover = false;
 volatile bool safe_eject_active = false;
@@ -1029,8 +1110,19 @@ static void init_littlefs(void) {
     esp_vfs_littlefs_conf_t conf = {
         .base_path = "/fs", .partition_label = "spiffs", .format_if_mount_failed = true, .dont_mount = false,
     };
-    if (esp_vfs_littlefs_register(&conf) == ESP_OK) ESP_LOGI(TAG, "LittleFS mounted for offline buffering.");
-    else ESP_LOGE(TAG, "LittleFS mount failed; offline buffering unavailable.");
+    if (esp_vfs_littlefs_register(&conf) == ESP_OK) {
+        ESP_LOGI(TAG, "LittleFS mounted for offline buffering.");
+        // A reset in the middle of a spool trim leaves SPOOL_TRIM_PATH behind:
+        // if the old spool was already removed, it IS the spool; otherwise it's
+        // a partial copy and the original is still intact.
+        struct stat st;
+        if (stat(SPOOL_TRIM_PATH, &st) == 0) {
+            if (stat(SPOOL_FILE_PATH, &st) != 0) rename(SPOOL_TRIM_PATH, SPOOL_FILE_PATH);
+            else remove(SPOOL_TRIM_PATH);
+        }
+    } else {
+        ESP_LOGE(TAG, "LittleFS mount failed; offline buffering unavailable.");
+    }
 }
 
 static double uptime_sec(void) {
@@ -1051,14 +1143,57 @@ static bool tenant_id_is_safe(const char *tid) {
     return true;
 }
 
+// Spool full: drop the OLDEST rows and keep the newest ~60% of the limit, so a
+// long outage loses its beginning, not everything. Trimming to 60% (not just
+// under the limit) means this runs once per ~40% of growth, not on every row.
+// Peak flash use during the copy is limit + 60% of it, well inside the ~1.9 MB
+// partition. Any I/O failure falls back to the old behaviour (wipe), so a full
+// or damaged filesystem can never wedge the spool. Caller holds spool_mutex.
+static void spool_trim_oldest(long size, long limit) {
+    long keep = limit * 6 / 10;
+    FILE *in = fopen(SPOOL_FILE_PATH, "r");
+    FILE *out = (in != NULL) ? fopen(SPOOL_TRIM_PATH, "w") : NULL;
+    bool ok = (in != NULL && out != NULL);
+
+    long dropped_rows = 0;
+    int c;
+    if (ok) {
+        long cut = size - keep;                       // bytes to drop, then to the next row start
+        for (long i = 0; i < cut && (c = fgetc(in)) != EOF; i++) if (c == '\n') dropped_rows++;
+        while ((c = fgetc(in)) != EOF && c != '\n') { }  // finish the row cut in half
+        if (c == '\n') dropped_rows++;
+        char buf[256];
+        size_t n;
+        while (ok && (n = fread(buf, 1, sizeof(buf), in)) > 0) ok = (fwrite(buf, 1, n, out) == n);
+        if (ferror(in)) ok = false;
+    }
+    if (in != NULL) fclose(in);
+    if (out != NULL && fclose(out) != 0) ok = false;
+
+    if (ok && remove(SPOOL_FILE_PATH) == 0 && rename(SPOOL_TRIM_PATH, SPOOL_FILE_PATH) == 0) {
+        ESP_LOGW(TAG, "Spool full (%ld bytes): dropped the %ld oldest rows, kept the newest ~%ld bytes.",
+                 size, dropped_rows, keep);
+    } else {
+        remove(SPOOL_TRIM_PATH);
+        remove(SPOOL_FILE_PATH);
+        ESP_LOGE(TAG, "Spool full and trimming failed; backlog wiped to protect flash.");
+    }
+}
+
 static void spool_append_line(const char *payload) {
     xSemaphoreTake(spool_mutex, portMAX_DELAY);
     struct stat st;
-    if (stat(SPOOL_FILE_PATH, &st) == 0 && st.st_size > SPOOL_MAX_BYTES) {
-        ESP_LOGE(TAG, "Spool reached %d bytes. Wiping backlog to protect flash.", SPOOL_MAX_BYTES);
-        remove(SPOOL_FILE_PATH);
+    // The limit covers BOTH files: an interrupted replay keeps its backlog in
+    // SPOOL_REPLAY_PATH while new rows go here, and together they must fit.
+    long limit = SPOOL_MAX_BYTES;
+    if (stat(SPOOL_REPLAY_PATH, &st) == 0) limit -= (long)st.st_size;
+    if (limit < SPOOL_MIN_LIVE_BYTES) limit = SPOOL_MIN_LIVE_BYTES;
+    if (stat(SPOOL_FILE_PATH, &st) == 0 && (long)st.st_size > limit) {
+        crumb("spool: trim oldest");
+        spool_trim_oldest((long)st.st_size, limit);
     }
     crumb("spool: flash append");
+    rows_spooled_while_down++;
     FILE *f = fopen(SPOOL_FILE_PATH, "a");
     bool ok = false;
     if (f != NULL) {
@@ -1981,6 +2116,19 @@ static void publish_node_config(void) {
     cJSON_AddStringToObject(root, "edge_broker", saved_uri);
     cJSON_AddStringToObject(root, "ntp_server", ntp_server[0] ? ntp_server : "pool.ntp.org");
     cJSON_AddNumberToObject(root, "tlm_interval_ms", tlm_interval_ms);
+    // The last network outage (not a reboot; that's last_reset below).
+    if (link_mutex != NULL && xSemaphoreTake(link_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (last_disconnect.valid) {
+            cJSON *ld = cJSON_AddObjectToObject(root, "last_disconnect");
+            cJSON_AddStringToObject(ld, "cause", last_disconnect.cause);
+            cJSON_AddStringToObject(ld, "reason", last_disconnect.reason);
+            if (last_disconnect.reason_code) cJSON_AddNumberToObject(ld, "reason_code", last_disconnect.reason_code);
+            if (last_disconnect.at_epoch)    cJSON_AddNumberToObject(ld, "at", (double)last_disconnect.at_epoch);
+            cJSON_AddNumberToObject(ld, "offline_s", last_disconnect.offline_s);
+            cJSON_AddNumberToObject(ld, "rows_spooled", last_disconnect.rows_spooled);
+        }
+        xSemaphoreGive(link_mutex);
+    }
     // Why this boot started, and where the previous one was when it ended, so the
     // dashboard can show unexpected restarts without a serial cable attached.
     cJSON_AddStringToObject(root, "last_reset", prev_reset_reason);
@@ -2012,6 +2160,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT Connected! Route: %s", current_route_state == ROUTE_CLOUD ? "CLOUD" : "LOCAL");
         is_mqtt_connected = true;
         cloud_disconnect_count = 0;
+        note_link_up();   // before publish_node_config(), which reports it
         xEventGroupSetBits(s_network_event_group, MQTT_CONNECTED_BIT);
         xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
 
@@ -2024,6 +2173,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     else if (event_id == MQTT_EVENT_DISCONNECTED) {
         ESP_LOGW(TAG, "MQTT Disconnected.");
         is_mqtt_connected = false;
+        note_link_down("mqtt", "connection_lost", 0);
         xEventGroupClearBits(s_network_event_group, MQTT_CONNECTED_BIT);
 
         if (current_hw_mode == HW_MODE_WIFI && current_route_state == ROUTE_CLOUD) {
@@ -2610,7 +2760,7 @@ void discovery_builder_task(void *pvParameter) {
 // Called only once the offline backlog is fully delivered. Follows the order
 // agreed with the backend, on the PREVIOUS tenant's topics:
 //   1. backlog sent (already done by the caller)
-//   2. retained {"t":"lwt","status":"offline"}  -> A's dashboard shows Offline at once
+//   2. retained {"t":"lwt","status":"offline","reason":"tenant_change"} -> A shows Offline at once
 //   3. empty retained disco                     -> clears the stale retained copy
 //   4. empty retained config                    -> stops stale settings replaying into A
 // Then records the new tenant in NVS so later boots use a normal session.
@@ -2622,7 +2772,10 @@ static bool complete_tenant_handover(void) {
         snprintf(old_disco,  sizeof(old_disco),  "%s/%s/%s/disco",  MQTT_TOPIC_ROOT, previous_tenant_id, node_id);
         snprintf(old_config, sizeof(old_config), "%s/%s/%s/config", MQTT_TOPIC_ROOT, previous_tenant_id, node_id);
 
-        if (esp_mqtt_client_publish(mqtt_client, old_status, "{\"t\":\"lwt\",\"status\":\"offline\"}", 0, 1, 1) < 0 ||
+        // "reason" tells ingest this node LEFT the tenant (don't re-create it there).
+        // The new tenant's ID is deliberately not included.
+        if (esp_mqtt_client_publish(mqtt_client, old_status,
+                                    "{\"t\":\"lwt\",\"status\":\"offline\",\"reason\":\"tenant_change\"}", 0, 1, 1) < 0 ||
             esp_mqtt_client_publish(mqtt_client, old_disco,  "", 0, 1, 1) < 0 ||
             esp_mqtt_client_publish(mqtt_client, old_config, "", 0, 1, 1) < 0) {
             ESP_LOGW(TAG, "Tenant handover: could not close out %s yet; will retry.", previous_tenant_id);
@@ -2800,8 +2953,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Wi-Fi disconnected. Retrying...");
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)event_data;
+        int reason = d ? d->reason : 0;
+        ESP_LOGW(TAG, "Wi-Fi disconnected: %s (reason %d). Retrying...", wifi_reason_name(reason), reason);
         crumb("wifi: disconnected");
+        note_link_down("wifi", wifi_reason_name(reason), reason);
         xEventGroupClearBits(s_network_event_group, MQTT_CONNECTED_BIT);
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -2985,6 +3141,7 @@ void app_main(void) {
     command_queue = xQueueCreate(CMD_QUEUE_DEPTH, sizeof(cmd_msg_t));
     tlm_out_queue = xQueueCreate(TLM_OUT_QUEUE_DEPTH, sizeof(cJSON *));
     spool_mutex    = xSemaphoreCreateMutex();
+    link_mutex     = xSemaphoreCreateMutex();
     mqtt_cfg_mutex = xSemaphoreCreateMutex();
     if (command_queue == NULL) ESP_LOGE(TAG, "Failed to allocate command queue; C2 unavailable.");
 
