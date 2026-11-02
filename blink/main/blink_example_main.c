@@ -127,7 +127,12 @@ static const char *TAG = "THESIS_NODE";
 #define CELLULAR_BRINGUP_RETRY_MS           15000
 #define CELLULAR_NET_WAIT_TIMEOUT_MS        60000
 #define CELLULAR_PPP_DROP_TIMEOUT_SEC       30
-#define CELLULAR_MQTT_OFFLINE_TIMEOUT_SEC   180
+// A modem that resets itself (supply dip during a TX burst) or a glitch on its
+// UART ("Rx Break") can leave PPP "up" on the ESP32 while no data flows: DNS and
+// MQTT then fail forever without IP_EVENT_PPP_LOST_IP. Detect it from MQTT:
+#define CELLULAR_MQTT_OFFLINE_TIMEOUT_SEC   75     // hard cap (was 180 s)
+#define CELLULAR_MQTT_FAILS_BEFORE_RESET    3      // the drop + 2 failed reconnects (~50 s)...
+#define CELLULAR_MQTT_FAILS_MIN_OFFLINE_SEC 30     // ...but never sooner than this
 
 // --- Timekeeping ---
 #define MIN_VALID_EPOCH            1704067200   // 2024-01-01T00:00:00Z; anything earlier is an unset clock
@@ -228,6 +233,8 @@ typedef enum { ROUTE_CLOUD = 0, ROUTE_LOCAL = 1 } RoutingState_t;
 static HardwareConfig_t current_hw_mode = HW_MODE_WIFI;
 static RoutingState_t current_route_state = ROUTE_CLOUD;
 static int cloud_disconnect_count = 0;
+static volatile int cell_mqtt_fail_count = 0;   // MQTT drops/failed connects on cellular since the last connect
+static uint32_t cell_modem_resets = 0;          // link-dead modem resets this boot (reported in config)
 
 // ---- Why the node last lost its link (reported in the next config packet) ----
 // Down = from the first Wi-Fi or MQTT disconnect until MQTT is connected again.
@@ -274,8 +281,12 @@ static const char *wifi_reason_name(int r) {
 static void note_link_down(const char *cause, const char *reason, int code) {
     if (link_mutex == NULL || xSemaphoreTake(link_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
     int64_t now = esp_timer_get_time();
-    bool upgrade = link_down_since_us != 0 && strcmp(cause, "wifi") == 0 &&
-                   strcmp(link_down.cause, "mqtt") == 0 && (now - link_down_since_us) < 30000000LL;
+    // Re-attribute an outage first seen as an MQTT drop: to Wi-Fi if the radio
+    // reports a loss within 30 s; to the cellular link whenever the modem had to
+    // be reset because no data was flowing (that is found out later, by design).
+    bool upgrade = link_down_since_us != 0 && strcmp(link_down.cause, "mqtt") == 0 &&
+                   ((strcmp(cause, "wifi") == 0 && (now - link_down_since_us) < 30000000LL) ||
+                    strcmp(cause, "cell") == 0);
     if (link_down_since_us == 0 || upgrade) {
         if (link_down_since_us == 0) {
             link_down_since_us = now;
@@ -2116,6 +2127,7 @@ static void publish_node_config(void) {
     cJSON_AddStringToObject(root, "edge_broker", saved_uri);
     cJSON_AddStringToObject(root, "ntp_server", ntp_server[0] ? ntp_server : "pool.ntp.org");
     cJSON_AddNumberToObject(root, "tlm_interval_ms", tlm_interval_ms);
+    if (current_hw_mode == HW_MODE_CELLULAR) cJSON_AddNumberToObject(root, "modem_resets", cell_modem_resets);
     // The last network outage (not a reboot; that's last_reset below).
     if (link_mutex != NULL && xSemaphoreTake(link_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (last_disconnect.valid) {
@@ -2160,6 +2172,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT Connected! Route: %s", current_route_state == ROUTE_CLOUD ? "CLOUD" : "LOCAL");
         is_mqtt_connected = true;
         cloud_disconnect_count = 0;
+        cell_mqtt_fail_count = 0;
         note_link_up();   // before publish_node_config(), which reports it
         xEventGroupSetBits(s_network_event_group, MQTT_CONNECTED_BIT);
         xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
@@ -2175,6 +2188,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         is_mqtt_connected = false;
         note_link_down("mqtt", "connection_lost", 0);
         xEventGroupClearBits(s_network_event_group, MQTT_CONNECTED_BIT);
+        if (current_hw_mode == HW_MODE_CELLULAR) cell_mqtt_fail_count++;
 
         if (current_hw_mode == HW_MODE_WIFI && current_route_state == ROUTE_CLOUD) {
             cloud_disconnect_count++;
@@ -2364,7 +2378,12 @@ static void ppp_ip_event_handler(void *arg, esp_event_base_t base, int32_t event
 }
 
 static bool modem_bring_up(void) {
-    esp_modem_set_mode(modem_dce, ESP_MODEM_MODE_COMMAND);
+    // After a link reset, entering command mode fails if the modem had rebooted
+    // by itself (it is already in command mode and doesn't answer the escape):
+    // a hint that its supply dipped. Logged only; bring-up continues either way.
+    if (esp_modem_set_mode(modem_dce, ESP_MODEM_MODE_COMMAND) != ESP_OK && cell_modem_resets > 0) {
+        ESP_LOGW(TAG, "Modem was not in data mode: it may have rebooted on its own (check +5VP during TX bursts).");
+    }
     int tries = 0;
     while (esp_modem_sync(modem_dce) != ESP_OK) {
         if (++tries >= MODEM_SYNC_RETRIES) {
@@ -2426,6 +2445,10 @@ void cellular_task(void *pvParameter) {
         vTaskDelete(NULL);
         return;
     }
+    // Idle UART is HIGH. With the modem unpowered/rebooting or a loose wire the
+    // RX pin floats and reads as a "break" (uart_terminal: Rx Break). The
+    // internal pull-up (~45 kOhm) keeps it idle; it does not fix a bad contact.
+    gpio_set_pull_mode(MODEM_UART_RX_PIN, GPIO_PULLUP_ONLY);
 
     while (1) {
         while (!modem_bring_up()) {
@@ -2453,11 +2476,25 @@ void cellular_task(void *pvParameter) {
             if (!is_mqtt_connected) mqtt_offline_seconds++;
             else mqtt_offline_seconds = 0;
 
-            if (down_seconds >= CELLULAR_PPP_DROP_TIMEOUT_SEC ||
-                mqtt_offline_seconds >= CELLULAR_MQTT_OFFLINE_TIMEOUT_SEC) {
-                ESP_LOGW(TAG, "Cellular link dead (PPP dropped or MQTT timeout). Forcing modem reset.");
+            const char *why = NULL;
+            if (down_seconds >= CELLULAR_PPP_DROP_TIMEOUT_SEC) {
+                why = "ppp_lost";
+            } else if (mqtt_offline_seconds >= CELLULAR_MQTT_OFFLINE_TIMEOUT_SEC) {
+                why = "no_data_timeout";
+            } else if (cell_mqtt_fail_count >= CELLULAR_MQTT_FAILS_BEFORE_RESET &&
+                       mqtt_offline_seconds >= CELLULAR_MQTT_FAILS_MIN_OFFLINE_SEC) {
+                why = "no_data_reconnects_failed";   // e.g. DNS fails on a PPP link that looks up
+            }
+            if (why != NULL) {
+                cell_modem_resets++;
+                ESP_LOGW(TAG, "Cellular link dead (%s: MQTT offline %d s, %d failed connects). "
+                              "Resetting modem link (#%lu this boot).",
+                         why, mqtt_offline_seconds, cell_mqtt_fail_count, (unsigned long)cell_modem_resets);
+                note_link_down("cell", why, 0);
+                crumb("cell: modem link reset");
                 esp_modem_set_mode(modem_dce, ESP_MODEM_MODE_COMMAND);
                 xEventGroupClearBits(s_network_event_group, PPP_CONNECTED_BIT);
+                cell_mqtt_fail_count = 0;
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(1000));
