@@ -211,6 +211,13 @@ typedef struct {
 
 TaskHandle_t auto_shutoff_task_handles[NUM_ACTUATORS] = {NULL};
 
+// What each output is doing right now, reported in the config message so the
+// dashboard always matches the hardware (e.g. after a reboot every output is
+// off, whatever the dashboard last showed). Single-byte writes are atomic on
+// the ESP32, so the reader (config publisher) needs no lock.
+static volatile uint8_t out_is_pwm[NUM_ACTUATORS];   // 0 = bin, 1 = pwm (last commanded mode)
+static volatile uint8_t out_value[NUM_ACTUATORS];    // bin: 0/1; pwm: duty 0-255; 0 = off
+
 // ==========================================
 // A7670C MODEM UART
 // ==========================================
@@ -343,7 +350,6 @@ char tenant_id[32] = DEFAULT_TENANT_ID;
 // ==========================================
 #define I2C_MASTER_SDA_IO   21
 #define I2C_MASTER_SCL_IO   22
-#define TCA4307_EN_GPIO     15   // LLC-boosted hardware gate (harmless if the TCA4307 is bypassed)
 #define I2C_MASTER_FREQ_HZ  100000
 // I2C ISR IRAM-safe lets the I2C interrupt keep running while flash is being
 // written. Enable in menuconfig (I2C driver options, "ISR IRAM-safe"); the
@@ -570,13 +576,28 @@ static void configure_mqtt_client(void);
 static esp_err_t i2c_master_init(void);
 static void recover_i2c_bus(void);
 static void send_command_ack(const char *cid, const char *action, const char *status, const char *details);
+static void publish_node_config(void);
+// Timing carried by actuation ACKs (all wall-clock ms, 0 = unknown). Lets the
+// backend measure command latency to the millisecond, like the ping reply:
+//   rx_ms   the command reached this node (stamped in the MQTT handler)
+//   act_ms  the output was actually switched (on/off, or auto-shutoff)
+//   ts_ms   the ACK was sent (stamped last, just before publish)
+//   t0      echoed from the command if the sender included one
+typedef struct {
+    int64_t rx_ms;
+    int64_t act_ms;
+    bool    has_t0;
+    double  t0;
+} ack_timing_t;
+static void send_command_ack_timed(const char *cid, const char *action, const char *status,
+                                   const char *details, const ack_timing_t *tm);
 
 // ==========================================
 // STATUS LED & HARDWARE GATE INITIALIZATION
 // ==========================================
 static void init_system_leds(void) {
     gpio_config_t led_cfg = {
-        .pin_bit_mask = (1ULL << SYSTEM_LED_NET) | (1ULL << SYSTEM_LED_FAULT) | (1ULL << TCA4307_EN_GPIO),
+        .pin_bit_mask = (1ULL << SYSTEM_LED_NET) | (1ULL << SYSTEM_LED_FAULT),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -585,7 +606,6 @@ static void init_system_leds(void) {
     gpio_config(&led_cfg);
     gpio_set_level(SYSTEM_LED_NET, 0);
     gpio_set_level(SYSTEM_LED_FAULT, 0);
-    gpio_set_level(TCA4307_EN_GPIO, 1);   // gate ON by default
 }
 
 // Network LED: solid when MQTT is connected, 2 Hz blink when not.
@@ -935,12 +955,9 @@ void time_sync_task(void *pvParameter) {
 // ==========================================
 // TWO-STEP ACKNOWLEDGEMENT LOGIC
 // ==========================================
-static void send_command_ack(const char *cid, const char *action, const char *status, const char *details) {
-    if (!is_mqtt_connected || mqtt_client == NULL) return;
-
+static cJSON *build_ack(const char *cid, const char *action, const char *status, const char *details) {
     cJSON *ack_root = cJSON_CreateObject();
-    if (ack_root == NULL) return;
-
+    if (ack_root == NULL) return NULL;
     cJSON_AddStringToObject(ack_root, "t", "ack");
     cJSON_AddNumberToObject(ack_root, "v", 1);
     cJSON_AddStringToObject(ack_root, "tid", tenant_id);
@@ -950,6 +967,14 @@ static void send_command_ack(const char *cid, const char *action, const char *st
     cJSON_AddStringToObject(ack_root, "status", status);
     cJSON_AddStringToObject(ack_root, "details", details ? details : "");
     if (clock_trusted()) cJSON_AddNumberToObject(ack_root, "ts", (double)node_epoch());   // omitted, not faked, before the clock is set
+    return ack_root;
+}
+
+static void send_command_ack(const char *cid, const char *action, const char *status, const char *details) {
+    if (!is_mqtt_connected || mqtt_client == NULL) return;
+
+    cJSON *ack_root = build_ack(cid, action, status, details);
+    if (ack_root == NULL) return;
 
     char *payload = cJSON_PrintUnformatted(ack_root);
     if (payload != NULL) {
@@ -959,6 +984,40 @@ static void send_command_ack(const char *cid, const char *action, const char *st
         } else {
             ESP_LOGI(TAG, "Command ACK published -> Status: %s | Action: %s | ID: %s",
                      status, action ? action : "unknown", cid ? cid : "unknown");
+        }
+        free(payload);
+    }
+    cJSON_Delete(ack_root);
+}
+
+// Actuation ACK with timing. Sent with publish() (like the ping reply), not
+// enqueue(), which can sit up to 1 s in the outbox: ts_ms is then the real
+// send time. The output has already been switched before this is called, so
+// a slow network only delays the ACK, never the actuation.
+// Timing fields only after an SNTP sync this boot (else whole-second RTC time).
+static void send_command_ack_timed(const char *cid, const char *action, const char *status,
+                                   const char *details, const ack_timing_t *tm) {
+    if (!is_mqtt_connected || mqtt_client == NULL) return;
+
+    cJSON *ack_root = build_ack(cid, action, status, details);
+    if (ack_root == NULL) return;
+
+    cJSON_AddStringToObject(ack_root, "net", (current_hw_mode == HW_MODE_CELLULAR) ? "cell" : "wifi");
+    cJSON_AddStringToObject(ack_root, "rt", current_route_state == ROUTE_CLOUD ? "cloud" : "edge");
+    if (tm != NULL && tm->has_t0) cJSON_AddNumberToObject(ack_root, "t0", tm->t0);
+    if (tm != NULL && sntp_ever_synced) {
+        if (tm->rx_ms > 0)  cJSON_AddNumberToObject(ack_root, "rx_ms", (double)tm->rx_ms);
+        if (tm->act_ms > 0) cJSON_AddNumberToObject(ack_root, "act_ms", (double)tm->act_ms);
+        cJSON_AddNumberToObject(ack_root, "sync_age_s", (double)sntp_age_s());
+        cJSON_AddNumberToObject(ack_root, "ts_ms", (double)wall_ms());   // last: closest to the send
+    }
+
+    char *payload = cJSON_PrintUnformatted(ack_root);
+    if (payload != NULL) {
+        if (esp_mqtt_client_publish(mqtt_client, topic_ack, payload, 0, 1, 0) < 0) {
+            ESP_LOGW(TAG, "ACK publish failed for ID %s", cid ? cid : "unknown");
+        } else {
+            ESP_LOGI(TAG, "Command ACK published -> %s", payload);
         }
         free(payload);
     }
@@ -1046,6 +1105,7 @@ static void init_actuators(void) {
 
 static void actuator_force_off(int idx) {
     ledc_stop(ACTUATOR_LEDC_MODE, actuator_channels[idx], 0);
+    out_value[idx] = 0;
 }
 
 // Auto-shutoff timers are cancelled by task notification, never vTaskDelete().
@@ -1060,18 +1120,22 @@ void auto_shutoff_task(void *pvParameter) {
     uint32_t cancelled = ulTaskNotifyTake(pdTRUE, LONG_MS_TO_TICKS(args.duration_ms));
 
     bool owner = false;
+    int64_t off_ms = 0;
     if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
         if (!cancelled && auto_shutoff_task_handles[args.target_idx] == xTaskGetCurrentTaskHandle()) {
             owner = true;
             auto_shutoff_task_handles[args.target_idx] = NULL;
             actuator_force_off(args.target_idx);
+            off_ms = sntp_ever_synced ? wall_ms() : 0;
         }
         xSemaphoreGive(task_tracking_mutex);
     }
 
     if (owner) {
         ESP_LOGW(TAG, ">>> Auto-shutoff triggered for OUT%d after %d ms <<<", args.target_idx + 1, args.duration_ms);
-        send_command_ack(args.cid, "actuate", "completed", "Auto-shutoff execution window expired safely");
+        ack_timing_t tm = { .rx_ms = 0, .act_ms = off_ms, .has_t0 = false, .t0 = 0 };
+        send_command_ack_timed(args.cid, "actuate", "completed", "Auto-shutoff execution window expired safely", &tm);
+        publish_node_config();   // keep the retained output states current
     }
     vTaskDelete(NULL);
 }
@@ -1333,15 +1397,8 @@ static void recover_i2c_bus(void) {
         if (ds3231_handle != NULL) { i2c_master_bus_rm_device(ds3231_handle); ds3231_handle = NULL; }
         if (bus_handle != NULL) { i2c_del_master_bus(bus_handle); bus_handle = NULL; }
 
-        // 2. Cycle the hardware gate (no-op if the TCA4307 is bypassed)
-        crumb("i2c recovery: gate cycle");
-        ESP_LOGW(TAG, "Cycling bus gate EN (GPIO %d) LOW -> HIGH...", TCA4307_EN_GPIO);
-        gpio_set_level(TCA4307_EN_GPIO, 0);
-        vTaskDelay(pdMS_TO_TICKS(25));
-        gpio_set_level(TCA4307_EN_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(25));
-
-        // 3. Release any slave holding SDA low
+        // 2. Release any slave holding SDA low
+        //    (PCB rev 2 has no TCA4307 bus buffer, so there is no gate to cycle.)
         crumb("i2c recovery: bus clear");
         if (!i2c_bus_clear()) {
             if (!bus_held) {
@@ -1357,7 +1414,7 @@ static void recover_i2c_bus(void) {
         if (bus_held) ESP_LOGI(TAG, "I2C lines released. Restarting the I2C driver.");
         bus_held = false;
 
-        // 4. Re-initialise the master and restore the RTC
+        // 3. Re-initialise the master and restore the RTC
         crumb("i2c recovery: driver re-init");
         if (i2c_master_init() == ESP_OK) {
             i2c_device_config_t ds_cfg = {
@@ -1366,7 +1423,7 @@ static void recover_i2c_bus(void) {
                 .scl_speed_hz = I2C_MASTER_FREQ_HZ
             };
             i2c_master_bus_add_device(bus_handle, &ds_cfg, &ds3231_handle);
-            ESP_LOGI(TAG, "I2C master, bus gate and RTC restored.");
+            ESP_LOGI(TAG, "I2C master and RTC restored.");
             crumb("i2c recovery: done");
         } else {
             ESP_LOGE(TAG, "Fatal fault re-instantiating the I2C master bus.");
@@ -1523,7 +1580,7 @@ static void scan_i2c_bus(void) {
     uint32_t cooldown_ms = bus_fault ? fault_cooldown_ms : I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS;
     if ((now - last_zero_chip_recovery_tick) < pdMS_TO_TICKS(cooldown_ms)) return;
 
-    // Healthy bus, no pods: a few attempts (the gate can latch), then stop.
+    // Healthy bus, no pods: a few attempts, then stop.
     // perform_i2c_probe_pass() still runs every scan, so a pod plugged in later
     // is discovered and resets the counter.
     if (!bus_fault && zero_chip_recovery_attempts >= MAX_ZERO_CHIP_RECOVERIES) return;
@@ -1773,14 +1830,17 @@ static void process_incoming_command(const char *json_string, size_t length, int
 
     // 5. Broker redelivery guard. The command DID execute on first receipt, so
     //    "completed" is accurate; the details field carries the distinction.
-    if (cmd_already_seen(cid_buf)) {
+    //    Pings are exempt: a duplicate ping only costs a second "pong", and at one
+    //    ping every 10 s they would push real commands out of the short history.
+    bool is_ping = (strcmp(action, "ping") == 0);
+    if (!is_ping && cmd_already_seen(cid_buf)) {
         ESP_LOGW(TAG, "Duplicate command ID [%s] action [%s] -- broker redelivery, not re-executing.",
                  cid_buf, action);
         send_command_ack(cid_buf, action, "completed", "Command already executed; redelivery ignored");
         cJSON_Delete(root);
         return;
     }
-    cmd_remember(cid_buf);
+    if (!is_ping) cmd_remember(cid_buf);
 
     // --- ACTION: BUS RECOVERY ---
     if (strcmp(action, "bus_recovery") == 0) {
@@ -1860,24 +1920,38 @@ static void process_incoming_command(const char *json_string, size_t length, int
         //    an expiring old timer can never switch off the new output.
         cancel_auto_shutoff(target_idx);
 
-        // 3. Drive the output
+        // 3. Drive the output, and stamp when it actually switched (before logging)
         ledc_channel_t chan = actuator_channels[target_idx];
+        int64_t act_ms = 0;
         if (is_binary) {
             ledc_stop(ACTUATOR_LEDC_MODE, chan, bin_state);
+            if (sntp_ever_synced) act_ms = wall_ms();
+            out_is_pwm[target_idx] = 0;
+            out_value[target_idx]  = (uint8_t)bin_state;
             ESP_LOGI(TAG, "Binary: OUT%d (GPIO %d) -> %d [Duration: %d ms]",
                      target_idx + 1, actuator_gpios[target_idx], bin_state, duration_ms);
         } else {
             uint32_t duty = (pwm_duty >= 255) ? ACTUATOR_DUTY_FULL : (uint32_t)pwm_duty;
             ledc_set_duty(ACTUATOR_LEDC_MODE, chan, duty);
             ledc_update_duty(ACTUATOR_LEDC_MODE, chan);
+            if (sntp_ever_synced) act_ms = wall_ms();
+            out_is_pwm[target_idx] = 1;
+            out_value[target_idx]  = (uint8_t)pwm_duty;
             ESP_LOGI(TAG, "PWM: OUT%d (GPIO %d) -> Duty: %d/255 [Duration: %d ms]",
                      target_idx + 1, actuator_gpios[target_idx], pwm_duty, duration_ms);
         }
 
-        // 4. Arm auto-shutoff and acknowledge
+        // 4. Arm auto-shutoff and acknowledge (with timing: arrival, switch, send)
+        cJSON *t0_item = cJSON_GetObjectItem(root, "t0");
+        ack_timing_t tm = {
+            .rx_ms  = rx_ms,
+            .act_ms = act_ms,
+            .has_t0 = cJSON_IsNumber(t0_item),
+            .t0     = cJSON_IsNumber(t0_item) ? t0_item->valuedouble : 0,
+        };
         if (actuator_active_state && duration_ms > 0) {
             if (arm_auto_shutoff(target_idx, duration_ms, cid_buf)) {
-                send_command_ack(cid_buf, action, "started", "Actuator driven high, auto-shutoff armed");
+                send_command_ack_timed(cid_buf, action, "started", "Actuator driven high, auto-shutoff armed", &tm);
             } else {
                 actuator_force_off(target_idx);
                 ESP_LOGE(TAG, "Could not arm auto-shutoff on OUT%d; forced off for safety.", target_idx + 1);
@@ -1885,10 +1959,11 @@ static void process_incoming_command(const char *json_string, size_t length, int
                                  "Could not arm auto-shutoff; actuator forced off for safety");
             }
         } else if (actuator_active_state) {
-            send_command_ack(cid_buf, action, "started", "Actuator driven high indefinitely");
+            send_command_ack_timed(cid_buf, action, "started", "Actuator driven high indefinitely", &tm);
         } else {
-            send_command_ack(cid_buf, action, "stopped", "Actuator set to default idle state");
+            send_command_ack_timed(cid_buf, action, "stopped", "Actuator set to default idle state", &tm);
         }
+        publish_node_config();   // after the ACK, so the ACK's ts_ms stays a clean latency stamp
     }
 
     // --- ACTION: SENSOR PORT CONFIGURATION ---
@@ -2034,12 +2109,27 @@ static void publish_node_config(void) {
         cJSON_AddStringToObject(root, "last_task", prev_last_task);
         cJSON_AddNumberToObject(root, "prev_uptime_s", prev_uptime_s);
     }
+    // Current output states, same field names as the actuate command:
+    // {"port":1,"mode":"bin","state":0} or {"port":2,"mode":"pwm","duty":128}.
+    cJSON *outs = cJSON_AddArrayToObject(root, "outputs");
+    for (int i = 0; i < NUM_ACTUATORS; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "port", i + 1);
+        if (out_is_pwm[i]) {
+            cJSON_AddStringToObject(o, "mode", "pwm");
+            cJSON_AddNumberToObject(o, "duty", out_value[i]);
+        } else {
+            cJSON_AddStringToObject(o, "mode", "bin");
+            cJSON_AddNumberToObject(o, "state", out_value[i]);
+        }
+        cJSON_AddItemToArray(outs, o);
+    }
     if (clock_trusted()) cJSON_AddNumberToObject(root, "ts", (double)node_epoch());
 
     char *payload = cJSON_PrintUnformatted(root);
     if (payload != NULL) {
-        // publish() is documented as safe from the MQTT event handler, which is
-        // where this is called from (MQTT_EVENT_CONNECTED).
+        // publish() is safe from the MQTT event handler (MQTT_EVENT_CONNECTED)
+        // and from the command / auto-shutoff tasks (after an output change).
         esp_mqtt_client_publish(mqtt_client, topic_config, payload, 0, 1, 1);
         ESP_LOGI(TAG, "Hardware Configuration Synced to Cloud -> %s", payload);
         free(payload);
@@ -2111,7 +2201,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "Command Packet Received on [%.*s]: %.*s",
                  event->topic_len, event->topic, event->data_len, event->data);
 
-        cmd_staging.rx_ms = sntp_ever_synced ? wall_ms() : 0;   // ping: arrival time
+        cmd_staging.rx_ms = sntp_ever_synced ? wall_ms() : 0;   // arrival time (ping + actuate ACKs)
         cmd_staging.len = (size_t)event->data_len;
         memcpy(cmd_staging.payload, event->data, event->data_len);
         cmd_staging.payload[event->data_len] = '\0';
@@ -2131,6 +2221,10 @@ static void configure_mqtt_client(void) {
 
     esp_mqtt_client_config_t mqtt_cfg = {0};
     mqtt_cfg.network.timeout_ms = MQTT_NETWORK_TIMEOUT_MS;
+    // Outgoing buffer: config (with the 8 output states) and a full 16-port
+    // telemetry row can approach the 1 KB default. 2 KB keeps every message
+    // in one buffer; costs ~1 KB of RAM.
+    mqtt_cfg.buffer.out_size = 2048;
 
     mqtt_cfg.credentials.client_id = node_id;
 
