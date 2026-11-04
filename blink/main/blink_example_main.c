@@ -12,7 +12,6 @@
  *   - Payload timestamps from the system clock (no I2C traffic per message)
  *   - Non-blocking MQTT publishing for telemetry, discovery and ACKs
  *   - Command execution moved out of the MQTT task; duplicate redelivery dropped
- *   - Safe-eject quiesce waits for the in-flight transaction before gating
  *   - Auto-shutoff timers cancelled by notification, not vTaskDelete()
  *   - Offline spooling in both Wi-Fi and cellular modes
  *   - Actuator PWM at 1 kHz
@@ -86,8 +85,6 @@ static const char *TAG = "THESIS_NODE";
 // ==========================================
 #define SYSTEM_LED_NET            14
 #define SYSTEM_LED_FAULT          23
-#define EJECT_BUTTON_GPIO         34   // Safe Eject slide switch (input-only; external 10k pull-up)
-#define EJECT_DEBOUNCE_MS         300  // switch must hold a new position this long to count
 #define PROVISION_SWITCH_GPIO     32   // Captive-portal provisioning switch
 
 // ==========================================
@@ -320,7 +317,6 @@ static void note_link_up(void) {
 }
 volatile bool is_mqtt_connected = false;
 volatile bool trigger_failover = false;
-volatile bool safe_eject_active = false;
 
 // ==========================================
 // DYNAMIC CREDENTIAL ARRAYS
@@ -593,14 +589,12 @@ static void init_system_leds(void) {
 }
 
 // Network LED: solid when MQTT is connected, 2 Hz blink when not.
-// Fault LED while safe eject is active: slow 1 Hz blink, so it can't be confused
-// with the solid "no ADS1115 detected" fault. Outside eject, the I2C scan owns it.
+// (The fault LED is owned by the I2C scan: solid = no ADS1115 detected.)
 void network_led_task(void *pvParameter) {
     uint32_t tick = 0;
     while (1) {
         tick++;
         gpio_set_level(SYSTEM_LED_NET, is_mqtt_connected ? 1 : (tick & 1));
-        if (safe_eject_active) gpio_set_level(SYSTEM_LED_FAULT, (tick >> 1) & 1);
         vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
@@ -906,7 +900,7 @@ void time_sync_task(void *pvParameter) {
                 rtc_write_due = true;
             }
         }
-        if (rtc_write_due && !safe_eject_active &&
+        if (rtc_write_due &&
             (now_tick - last_write_attempt) >= pdMS_TO_TICKS(RTC_WRITE_RETRY_MS)) {
             last_write_attempt = now_tick;
             time_t now = time(NULL);
@@ -928,7 +922,7 @@ void time_sync_task(void *pvParameter) {
         //    far less than the ESP32's own clock, so re-seed from it hourly.
         bool sntp_stale = !have_sntp ||
                           (now_tick - last_sntp_tick) > LONG_MS_TO_TICKS(RTC_SNTP_STALE_MS);
-        if (sntp_stale && !safe_eject_active &&
+        if (sntp_stale &&
             (now_tick - last_reseed_tick) > LONG_MS_TO_TICKS(RTC_RESEED_INTERVAL_MS)) {
             last_reseed_tick = now_tick;
             seed_system_time_from_ds3231(false);
@@ -1324,12 +1318,6 @@ static void mark_bus_offline(void) {
 }
 
 static void recover_i2c_bus(void) {
-    // Never reset the bus or touch the gate while a pod may be mid-swap.
-    if (safe_eject_active) {
-        ESP_LOGW(TAG, "I2C recovery skipped: safe eject is active.");
-        return;
-    }
-
     ESP_LOGW(TAG, "Executing structured hardware + software I2C recovery routine...");
 
     // Synchronise the cooldown globally so scan_i2c_bus() and ads_reader_task()
@@ -1451,10 +1439,6 @@ static int perform_i2c_probe_pass(bool *rtc_ok) {
     bool online[4];
     int found = 0;
     for (int i = 0; i < 4; i++) {
-        if (safe_eject_active) {             // switch flipped mid-pass: results would be meaningless
-            xSemaphoreGive(i2c_mutex);
-            return -1;
-        }
         bool ack = !bus_fault &&
                    probe_addr(possible_addresses[i]) == ESP_OK;
         if (ack) probe_misses[i] = 0;
@@ -1494,17 +1478,13 @@ static int perform_i2c_probe_pass(bool *rtc_ok) {
             global_node_data[i].is_online = online[i];
         }
         num_ads_found = (uint8_t)found;
-        if (!safe_eject_active) {
-            gpio_set_level(SYSTEM_LED_FAULT, (num_ads_found == 0) ? 1 : 0);
-        }
+        gpio_set_level(SYSTEM_LED_FAULT, (num_ads_found == 0) ? 1 : 0);
         xSemaphoreGive(data_mutex);
     }
     return bus_fault ? -2 : found;
 }
 
 static void scan_i2c_bus(void) {
-    if (safe_eject_active) return;
-
     if (bus_held) {
         // A battery-backed DS3231 cut off mid-byte (e.g. ESP32 reset by flashing)
         // holds SDA low until it gets clock pulses; reading the pins alone never
@@ -1531,7 +1511,7 @@ static void scan_i2c_bus(void) {
     bool rtc_ok = false;
     int found = perform_i2c_probe_pass(&rtc_ok);
 
-    if (found == -1 || safe_eject_active) return;       // bus busy or eject began mid-pass; try again next cycle
+    if (found == -1) return;       // bus busy; try again next cycle
     if (found > 0 || rtc_ok) fault_cooldown_ms = I2C_ZERO_CHIP_RECOVERY_COOLDOWN_MS;  // bus works
     if (found > 0) { zero_chip_recovery_attempts = 0; return; }
 
@@ -1566,89 +1546,6 @@ static void scan_i2c_bus(void) {
 }
 
 // ==========================================
-// SAFE EJECT SLIDE SWITCH
-// ==========================================
-static void apply_safe_eject(bool active) {
-    crumb(active ? "safe eject: on" : "safe eject: off");
-    if (active) {
-        // Wait for any in-flight transaction to finish before dropping the gate.
-        // Gating mid-transaction would leave a slave holding SDA low.
-        // 2 s: on a faulted bus one probe pass can hold the mutex well over 500 ms
-        // (each failing transfer may run to I2C_XFER_TIMEOUT_MS).
-        bool got_bus = (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(2000)) == pdTRUE);
-        safe_eject_active = true;
-        gpio_set_level(TCA4307_EN_GPIO, 0);    // fault LED now slow-blinks (network_led_task)
-        if (got_bus) xSemaphoreGive(i2c_mutex);
-        ESP_LOGW(TAG, ">>> SAFE EJECT ACTIVATED: bus quiesced, gate locked (GPIO %d)%s <<<",
-                 TCA4307_EN_GPIO, got_bus ? "" : " [bus was busy >2 s]");
-    } else {
-        // Boards may have been swapped during the eject: forget every ADS handle,
-        // so a chip counts as present only once it answers a fresh probe. Without
-        // this, a removed board kept its handle for 3 more scans and its read
-        // errors escalated to a full bus teardown.
-        if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-            for (int i = 0; i < 4; i++) {
-                if (ads_handles[i] != NULL) { i2c_master_bus_rm_device(ads_handles[i]); ads_handles[i] = NULL; }
-                probe_misses[i] = PROBE_MISS_LIMIT;
-            }
-            xSemaphoreGive(i2c_mutex);
-        }
-        // Raise the gate and let it settle BEFORE clearing the flag, so no task
-        // touches the bus during the gate's pre-charge.
-        gpio_set_level(TCA4307_EN_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(150));
-        safe_eject_active = false;
-        gpio_set_level(SYSTEM_LED_FAULT, 0);   // after the flag, so the blink can't leave it on; rescan sets the real state
-        ESP_LOGI(TAG, ">>> SAFE EJECT DEACTIVATED: gate open, rescanning <<<");
-        xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
-    }
-}
-
-void eject_button_task(void *pvParameter) {
-    gpio_config_t btn_cfg = {
-        .pin_bit_mask = (1ULL << EJECT_BUTTON_GPIO),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,     // GPIO 34 has no internal pulls
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&btn_cfg);
-
-    // Honour the switch position at boot (level 0 = switch to GND = eject), but
-    // only if it holds for the full debounce window: a single low sample at boot
-    // (a supply glitch) used to start the node in eject mode.
-    int last_level = 1;
-    if (gpio_get_level(EJECT_BUTTON_GPIO) == 0) {
-        bool stable_low = true;
-        for (int t = 0; t < EJECT_DEBOUNCE_MS && stable_low; t += 10) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            stable_low = (gpio_get_level(EJECT_BUTTON_GPIO) == 0);
-        }
-        if (stable_low) { last_level = 0; apply_safe_eject(true); }
-        else ESP_LOGW(TAG, "Eject switch glitched low at boot; ignored.");
-    }
-
-    // A change is accepted only after the pin has read the new level on every
-    // 10 ms sample for EJECT_DEBOUNCE_MS. A real flip of the switch easily
-    // passes; the ~100-250 ms glitches seen on GPIO 34 do not.
-    uint32_t stable_ms = 0;
-    while (1) {
-        int level = gpio_get_level(EJECT_BUTTON_GPIO);
-        if (level != last_level) {
-            stable_ms += 10;
-            if (stable_ms >= EJECT_DEBOUNCE_MS) {
-                apply_safe_eject(level == 0);
-                last_level = level;
-                stable_ms = 0;
-            }
-        } else {
-            stable_ms = 0;   // glitch ended before the window: ignore it
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
-// ==========================================
 // ADS1115 POLLING TASK (ATOMIC)
 // ==========================================
 // Port status for a window: 3 = no readable sample, 2 = saturated at any
@@ -1667,12 +1564,6 @@ void ads_reader_task(void *pvParameter) {
     bool chip_warned[4] = {false};   // one RTC check + log per failure run
 
     while (1) {
-        if (safe_eject_active) {
-            memset(chip_errors, 0, sizeof(chip_errors));
-            memset(chip_warned, 0, sizeof(chip_warned));
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
-        }
         TickType_t pass_start = xTaskGetTickCount();
 
         for (int i = 0; i < 4; i++) {
@@ -1681,7 +1572,6 @@ void ads_reader_task(void *pvParameter) {
 
             for (int channel = 0; channel < 4; channel++) {
                 if (!port_active[i][channel]) continue;
-                if (safe_eject_active) break;              // switch flipped mid-sweep
 
                 uint8_t config_data[3] = { REG_POINTER_CONFIG, ADS_MUX_MSB[channel], ADS_CONFIG_LSB };
                 uint8_t cfg_ptr  = REG_POINTER_CONFIG;
@@ -1754,7 +1644,7 @@ void ads_reader_task(void *pvParameter) {
         // that board is bad, so nothing is torn down -- its channels report -9999
         // and the probe pass drops it if it stops answering altogether. Only a bus
         // the RTC can't use gets a full teardown.
-        for (int i = 0; i < 4 && !safe_eject_active; i++) {
+        for (int i = 0; i < 4; i++) {
             if (chip_errors[i] < ADS_SUSTAINED_ERROR_LIMIT || chip_warned[i]) continue;
 
             bool bus_ok = false;
@@ -1894,15 +1784,10 @@ static void process_incoming_command(const char *json_string, size_t length, int
 
     // --- ACTION: BUS RECOVERY ---
     if (strcmp(action, "bus_recovery") == 0) {
-        if (safe_eject_active) {
-            send_command_ack(cid_buf, action, "failed",
-                             "Safe eject is active; bus recovery refused while a pod may be mid-swap");
-        } else {
-            send_command_ack(cid_buf, action, "started", "Beginning I2C recovery cycle");
-            recover_i2c_bus();
-            xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
-            send_command_ack(cid_buf, action, "completed", "I2C bus recovery complete");
-        }
+        send_command_ack(cid_buf, action, "started", "Beginning I2C recovery cycle");
+        recover_i2c_bus();
+        xEventGroupSetBits(s_hardware_event_group, I2C_RESCAN_REQUIRED_BIT);
+        send_command_ack(cid_buf, action, "completed", "I2C bus recovery complete");
     }
 
     // --- ACTION: ACTUATE ---
@@ -3240,7 +3125,6 @@ void app_main(void) {
     crumb("boot: starting tasks");
 
     xTaskCreate(network_led_task,       "led_worker",  2048, NULL, 2, NULL);
-    xTaskCreate(eject_button_task,      "eject_btn",   3072, NULL, 5, NULL);
     xTaskCreate(ads_reader_task,        "adc_worker",  3072, NULL, 5, NULL);
     xTaskCreate(telemetry_builder_task, "tlm_json",    4096, NULL, 5, NULL);
     xTaskCreate(telemetry_publisher_task, "tlm_pub",   3072, NULL, 5, NULL);
