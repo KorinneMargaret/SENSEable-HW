@@ -204,9 +204,11 @@ const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
 #define ACTUATOR_DUTY_FULL          (1 << 8)          // 2^res = true 100% (255 alone is 99.6%)
 
 typedef struct {
-    int  target_idx;
-    int  duration_ms;
-    char cid[MAX_CID_LEN];
+    int    target_idx;
+    int    duration_ms;
+    char   cid[MAX_CID_LEN];
+    bool   has_t0;       // the command's t0, echoed on the auto-off "completed" ACK
+    double t0;
 } auto_shutoff_args_t;
 
 TaskHandle_t auto_shutoff_task_handles[NUM_ACTUATORS] = {NULL};
@@ -583,11 +585,13 @@ static void publish_node_config(void);
 //   act_ms  the output was actually switched (on/off, or auto-shutoff)
 //   ts_ms   the ACK was sent (stamped last, just before publish)
 //   t0      echoed from the command if the sender included one
+//   port    the output (1-8) this ACK is about, so on/off ACKs pair without a cid lookup
 typedef struct {
     int64_t rx_ms;
     int64_t act_ms;
     bool    has_t0;
     double  t0;
+    int     port;        // 1-8, 0 = not an output ACK
 } ack_timing_t;
 static void send_command_ack_timed(const char *cid, const char *action, const char *status,
                                    const char *details, const ack_timing_t *tm);
@@ -1004,6 +1008,7 @@ static void send_command_ack_timed(const char *cid, const char *action, const ch
 
     cJSON_AddStringToObject(ack_root, "net", (current_hw_mode == HW_MODE_CELLULAR) ? "cell" : "wifi");
     cJSON_AddStringToObject(ack_root, "rt", current_route_state == ROUTE_CLOUD ? "cloud" : "edge");
+    if (tm != NULL && tm->port > 0) cJSON_AddNumberToObject(ack_root, "port", tm->port);
     if (tm != NULL && tm->has_t0) cJSON_AddNumberToObject(ack_root, "t0", tm->t0);
     if (tm != NULL && sntp_ever_synced) {
         if (tm->rx_ms > 0)  cJSON_AddNumberToObject(ack_root, "rx_ms", (double)tm->rx_ms);
@@ -1133,7 +1138,8 @@ void auto_shutoff_task(void *pvParameter) {
 
     if (owner) {
         ESP_LOGW(TAG, ">>> Auto-shutoff triggered for OUT%d after %d ms <<<", args.target_idx + 1, args.duration_ms);
-        ack_timing_t tm = { .rx_ms = 0, .act_ms = off_ms, .has_t0 = false, .t0 = 0 };
+        ack_timing_t tm = { .rx_ms = 0, .act_ms = off_ms, .has_t0 = args.has_t0, .t0 = args.t0,
+                            .port = args.target_idx + 1 };
         send_command_ack_timed(args.cid, "actuate", "completed", "Auto-shutoff execution window expired safely", &tm);
         publish_node_config();   // keep the retained output states current
     }
@@ -1151,12 +1157,14 @@ static void cancel_auto_shutoff(int idx) {
     }
 }
 
-static bool arm_auto_shutoff(int idx, int duration_ms, const char *cid) {
+static bool arm_auto_shutoff(int idx, int duration_ms, const char *cid, bool has_t0, double t0) {
     auto_shutoff_args_t *args = malloc(sizeof(auto_shutoff_args_t));
     if (args == NULL) return false;
     args->target_idx = idx;
     args->duration_ms = duration_ms;
     snprintf(args->cid, sizeof(args->cid), "%s", cid);
+    args->has_t0 = has_t0;
+    args->t0 = t0;
 
     bool ok = false;
     if (xSemaphoreTake(task_tracking_mutex, portMAX_DELAY) == pdTRUE) {
@@ -1948,9 +1956,10 @@ static void process_incoming_command(const char *json_string, size_t length, int
             .act_ms = act_ms,
             .has_t0 = cJSON_IsNumber(t0_item),
             .t0     = cJSON_IsNumber(t0_item) ? t0_item->valuedouble : 0,
+            .port   = target_idx + 1,
         };
         if (actuator_active_state && duration_ms > 0) {
-            if (arm_auto_shutoff(target_idx, duration_ms, cid_buf)) {
+            if (arm_auto_shutoff(target_idx, duration_ms, cid_buf, tm.has_t0, tm.t0)) {
                 send_command_ack_timed(cid_buf, action, "started", "Actuator driven high, auto-shutoff armed", &tm);
             } else {
                 actuator_force_off(target_idx);
