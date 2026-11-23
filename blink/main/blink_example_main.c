@@ -16,6 +16,10 @@
  *   - Offline spooling in both Wi-Fi and cellular modes
  *   - Actuator PWM at 1 kHz
  *
+ * Revision 2026-11-20:
+ *   - Per-output PWM frequency: optional "freq" (10-1000 Hz) on pwm actuate
+ *     commands; each output has its own LEDC timer. Reported in config/ACKs.
+ *
  * REQUIRED sdkconfig: CONFIG_FREERTOS_HZ=1000
  *   (menuconfig -> Component config -> FreeRTOS -> Kernel -> configTICK_RATE_HZ)
  */
@@ -56,6 +60,7 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/uart.h"
+#include "soc/soc_caps.h"   // SOC_LEDC_SUPPORT_HS_MODE / _REF_TICK (actuator timers)
 #include "esp_log.h"
 #include "cJSON.h"
 #include "esp_littlefs.h"
@@ -193,14 +198,53 @@ char topic_config[128];
 // ==========================================
 #define NUM_ACTUATORS       8
 const int actuator_gpios[NUM_ACTUATORS] = {4, 25, 13, 19, 26, 27, 33, 18};
+
+// Each output has its OWN LEDC timer, so each can run at its own PWM frequency
+// (a frequency belongs to a timer, not a channel). The ESP32 has 4 low-speed and
+// 4 high-speed timers: OUT1-4 use the low-speed ones, OUT5-8 the high-speed ones.
+#if SOC_LEDC_SUPPORT_HS_MODE
+static const ledc_mode_t actuator_modes[NUM_ACTUATORS] = {
+    LEDC_LOW_SPEED_MODE,  LEDC_LOW_SPEED_MODE,  LEDC_LOW_SPEED_MODE,  LEDC_LOW_SPEED_MODE,
+    LEDC_HIGH_SPEED_MODE, LEDC_HIGH_SPEED_MODE, LEDC_HIGH_SPEED_MODE, LEDC_HIGH_SPEED_MODE
+};
+const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
+    LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2, LEDC_CHANNEL_3,
+    LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2, LEDC_CHANNEL_3
+};
+#else
+// Chips without high-speed mode (not the ESP32): OUTn and OUTn+4 share a timer,
+// so they also share a frequency.
+static const ledc_mode_t actuator_modes[NUM_ACTUATORS] = {
+    LEDC_LOW_SPEED_MODE, LEDC_LOW_SPEED_MODE, LEDC_LOW_SPEED_MODE, LEDC_LOW_SPEED_MODE,
+    LEDC_LOW_SPEED_MODE, LEDC_LOW_SPEED_MODE, LEDC_LOW_SPEED_MODE, LEDC_LOW_SPEED_MODE
+};
 const ledc_channel_t actuator_channels[NUM_ACTUATORS] = {
     LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2, LEDC_CHANNEL_3,
     LEDC_CHANNEL_4, LEDC_CHANNEL_5, LEDC_CHANNEL_6, LEDC_CHANNEL_7
 };
-#define ACTUATOR_LEDC_MODE          LEDC_LOW_SPEED_MODE
-#define ACTUATOR_LEDC_TIMER         LEDC_TIMER_0
+#endif
+static const ledc_timer_t actuator_timers[NUM_ACTUATORS] = {
+    LEDC_TIMER_0, LEDC_TIMER_1, LEDC_TIMER_2, LEDC_TIMER_3,
+    LEDC_TIMER_0, LEDC_TIMER_1, LEDC_TIMER_2, LEDC_TIMER_3
+};
+
+// Timer clock: REF_TICK (1 MHz, unaffected by CPU/APB clock changes) reaches
+// ~4 Hz to ~3.9 kHz at 8-bit, so the whole allowed range is on ONE clock and
+// ledc_set_freq() can retune a running timer. (The 80 MHz APB clock cannot go
+// below ~305 Hz at 8-bit.)
+#if SOC_LEDC_SUPPORT_REF_TICK
+#define ACTUATOR_LEDC_CLK           LEDC_USE_REF_TICK
+#else
+#define ACTUATOR_LEDC_CLK           LEDC_AUTO_CLK
+#endif
 #define ACTUATOR_LEDC_RES           LEDC_TIMER_8_BIT
-#define ACTUATOR_LEDC_FREQ          1000              // 1 kHz: smooth proportional output
+#define ACTUATOR_LEDC_FREQ          1000              // default (boot) frequency, Hz
+#define ACTUATOR_FREQ_MIN_HZ        10                // heaters/slow loads; lights flicker visibly this low
+// Upper limit set by the DRIVER BOARD, not the ESP32: its LTV-217 optocoupler and
+// 10k/100k gate resistors take tens of microseconds per switching edge, so above
+// ~1 kHz the MOSFET spends too long half-on (heat) and small/large duties distort.
+// Raise only for faster driver hardware, after checking the edges on a scope.
+#define ACTUATOR_FREQ_MAX_HZ        1000
 #define ACTUATOR_DUTY_FULL          (1 << 8)          // 2^res = true 100% (255 alone is 99.6%)
 
 typedef struct {
@@ -219,6 +263,7 @@ TaskHandle_t auto_shutoff_task_handles[NUM_ACTUATORS] = {NULL};
 // the ESP32, so the reader (config publisher) needs no lock.
 static volatile uint8_t out_is_pwm[NUM_ACTUATORS];   // 0 = bin, 1 = pwm (last commanded mode)
 static volatile uint8_t out_value[NUM_ACTUATORS];    // bin: 0/1; pwm: duty 0-255; 0 = off
+static volatile uint16_t out_freq[NUM_ACTUATORS];    // PWM frequency of the output's timer, Hz (aligned 16-bit: atomic)
 
 // ==========================================
 // A7670C MODEM UART
@@ -586,12 +631,14 @@ static void publish_node_config(void);
 //   ts_ms   the ACK was sent (stamped last, just before publish)
 //   t0      echoed from the command if the sender included one
 //   port    the output (1-8) this ACK is about, so on/off ACKs pair without a cid lookup
+//   freq    PWM frequency (Hz) the output now runs at; pwm commands only
 typedef struct {
     int64_t rx_ms;
     int64_t act_ms;
     bool    has_t0;
     double  t0;
     int     port;        // 1-8, 0 = not an output ACK
+    int     freq;        // Hz, 0 = omit (bin commands, auto-shutoff)
 } ack_timing_t;
 static void send_command_ack_timed(const char *cid, const char *action, const char *status,
                                    const char *details, const ack_timing_t *tm);
@@ -1009,6 +1056,7 @@ static void send_command_ack_timed(const char *cid, const char *action, const ch
     cJSON_AddStringToObject(ack_root, "net", (current_hw_mode == HW_MODE_CELLULAR) ? "cell" : "wifi");
     cJSON_AddStringToObject(ack_root, "rt", current_route_state == ROUTE_CLOUD ? "cloud" : "edge");
     if (tm != NULL && tm->port > 0) cJSON_AddNumberToObject(ack_root, "port", tm->port);
+    if (tm != NULL && tm->freq > 0) cJSON_AddNumberToObject(ack_root, "freq", tm->freq);
     if (tm != NULL && tm->has_t0) cJSON_AddNumberToObject(ack_root, "t0", tm->t0);
     if (tm != NULL && sntp_ever_synced) {
         if (tm->rx_ms > 0)  cJSON_AddNumberToObject(ack_root, "rx_ms", (double)tm->rx_ms);
@@ -1073,15 +1121,27 @@ static void send_ping_reply(const char *cid, int64_t rx_ms, cJSON *cmd) {
 // ==========================================
 // ACTUATORS
 // ==========================================
+static bool same_actuator_timer(int a, int b) {
+    return actuator_modes[a] == actuator_modes[b] && actuator_timers[a] == actuator_timers[b];
+}
+
 static void init_actuators(void) {
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode      = ACTUATOR_LEDC_MODE,
-        .timer_num       = ACTUATOR_LEDC_TIMER,
-        .duty_resolution = ACTUATOR_LEDC_RES,
-        .freq_hz         = ACTUATOR_LEDC_FREQ,
-        .clk_cfg         = LEDC_AUTO_CLK
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+    // One timer per output (configured once each; shared only on chips without HS mode).
+    for (int i = 0; i < NUM_ACTUATORS; i++) {
+        bool already = false;
+        for (int j = 0; j < i; j++) if (same_actuator_timer(i, j)) already = true;
+        if (!already) {
+            ledc_timer_config_t ledc_timer = {
+                .speed_mode      = actuator_modes[i],
+                .timer_num       = actuator_timers[i],
+                .duty_resolution = ACTUATOR_LEDC_RES,
+                .freq_hz         = ACTUATOR_LEDC_FREQ,
+                .clk_cfg         = ACTUATOR_LEDC_CLK
+            };
+            ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));   // fixed boot values only
+        }
+        out_freq[i] = ACTUATOR_LEDC_FREQ;
+    }
 
     for (int i = 0; i < NUM_ACTUATORS; i++) {
         gpio_config_t io_conf = {
@@ -1095,9 +1155,9 @@ static void init_actuators(void) {
         gpio_set_level(actuator_gpios[i], 0);
 
         ledc_channel_config_t ledc_channel = {
-            .speed_mode     = ACTUATOR_LEDC_MODE,
+            .speed_mode     = actuator_modes[i],
             .channel        = actuator_channels[i],
-            .timer_sel      = ACTUATOR_LEDC_TIMER,
+            .timer_sel      = actuator_timers[i],
             .intr_type      = LEDC_INTR_DISABLE,
             .gpio_num       = actuator_gpios[i],
             .duty           = 0,
@@ -1105,12 +1165,32 @@ static void init_actuators(void) {
         };
         ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
     }
-    ESP_LOGI(TAG, "Actuator outputs OUT1-OUT%d ready (PWM %d Hz, 8-bit).", NUM_ACTUATORS, ACTUATOR_LEDC_FREQ);
+    ESP_LOGI(TAG, "Actuator outputs OUT1-OUT%d ready (PWM %d Hz default, %d-%d Hz per output, 8-bit).",
+             NUM_ACTUATORS, ACTUATOR_LEDC_FREQ, ACTUATOR_FREQ_MIN_HZ, ACTUATOR_FREQ_MAX_HZ);
+#if !SOC_LEDC_SUPPORT_HS_MODE
+    ESP_LOGW(TAG, "No high-speed LEDC timers on this chip: OUTn and OUTn+4 share one PWM frequency.");
+#endif
+#if !SOC_LEDC_SUPPORT_REF_TICK
+    ESP_LOGW(TAG, "LEDC REF_TICK clock unavailable: low PWM frequencies may be rejected by the hardware.");
+#endif
 }
 
 static void actuator_force_off(int idx) {
-    ledc_stop(ACTUATOR_LEDC_MODE, actuator_channels[idx], 0);
+    ledc_stop(actuator_modes[idx], actuator_channels[idx], 0);
     out_value[idx] = 0;
+}
+
+// Retunes the PWM timer of output idx. The duty register counts in 1/256ths of
+// a period, so the duty share is unchanged by a new frequency. Returns false if
+// the timer cannot produce hz; the driver then writes nothing, so the output
+// keeps running exactly as before.
+static bool actuator_set_freq(int idx, uint32_t hz) {
+    if (out_freq[idx] == hz) return true;
+    if (ledc_set_freq(actuator_modes[idx], actuator_timers[idx], hz) != ESP_OK) return false;
+    for (int j = 0; j < NUM_ACTUATORS; j++) {
+        if (same_actuator_timer(idx, j)) out_freq[j] = (uint16_t)hz;
+    }
+    return true;
 }
 
 // Auto-shutoff timers are cancelled by task notification, never vTaskDelete().
@@ -1922,17 +2002,47 @@ static void process_incoming_command(const char *json_string, size_t length, int
             return;
         }
 
+        // Optional PWM frequency (pwm mode only; ignored for bin, a steady level).
+        // Out of range is rejected, not clamped, like set_interval.
+        uint32_t pwm_freq = 0;   // 0 = keep the output's current frequency
+        if (!is_binary) {
+            cJSON *freq_item = cJSON_GetObjectItem(root, "freq");
+            if (freq_item != NULL) {
+                double f = cJSON_IsNumber(freq_item) ? freq_item->valuedouble : -1;
+                if (f < ACTUATOR_FREQ_MIN_HZ || f > ACTUATOR_FREQ_MAX_HZ || f != (double)(uint32_t)f) {
+                    char d[80];
+                    snprintf(d, sizeof(d), "Frequency out of range (%d-%d Hz, whole number)",
+                             ACTUATOR_FREQ_MIN_HZ, ACTUATOR_FREQ_MAX_HZ);
+                    send_command_ack(cid_buf, action, "failed", d);
+                    cJSON_Delete(root);
+                    return;
+                }
+                pwm_freq = (uint32_t)f;
+            }
+        }
+
         bool actuator_active_state = is_binary ? (bin_state == 1) : (pwm_duty > 0);
 
-        // 2. Cancel any pending auto-shutoff on this port BEFORE driving it, so
+        // 2. Retune the frequency FIRST: if the timer cannot produce it, nothing
+        //    has changed yet (output, duty and any pending auto-shutoff untouched).
+        if (pwm_freq > 0 && !actuator_set_freq(target_idx, pwm_freq)) {
+            ESP_LOGE(TAG, "OUT%d: %lu Hz not achievable by the PWM timer; command rejected.",
+                     target_idx + 1, (unsigned long)pwm_freq);
+            send_command_ack(cid_buf, action, "failed", "PWM frequency not achievable by the hardware; output unchanged");
+            cJSON_Delete(root);
+            return;
+        }
+
+        // 3. Cancel any pending auto-shutoff on this port BEFORE driving it, so
         //    an expiring old timer can never switch off the new output.
         cancel_auto_shutoff(target_idx);
 
-        // 3. Drive the output, and stamp when it actually switched (before logging)
-        ledc_channel_t chan = actuator_channels[target_idx];
+        // 4. Drive the output, and stamp when it actually switched (before logging)
+        ledc_mode_t    lmode = actuator_modes[target_idx];
+        ledc_channel_t chan  = actuator_channels[target_idx];
         int64_t act_ms = 0;
         if (is_binary) {
-            ledc_stop(ACTUATOR_LEDC_MODE, chan, bin_state);
+            ledc_stop(lmode, chan, bin_state);
             if (sntp_ever_synced) act_ms = wall_ms();
             out_is_pwm[target_idx] = 0;
             out_value[target_idx]  = (uint8_t)bin_state;
@@ -1940,16 +2050,17 @@ static void process_incoming_command(const char *json_string, size_t length, int
                      target_idx + 1, actuator_gpios[target_idx], bin_state, duration_ms);
         } else {
             uint32_t duty = (pwm_duty >= 255) ? ACTUATOR_DUTY_FULL : (uint32_t)pwm_duty;
-            ledc_set_duty(ACTUATOR_LEDC_MODE, chan, duty);
-            ledc_update_duty(ACTUATOR_LEDC_MODE, chan);
+            ledc_set_duty(lmode, chan, duty);
+            ledc_update_duty(lmode, chan);
             if (sntp_ever_synced) act_ms = wall_ms();
             out_is_pwm[target_idx] = 1;
             out_value[target_idx]  = (uint8_t)pwm_duty;
-            ESP_LOGI(TAG, "PWM: OUT%d (GPIO %d) -> Duty: %d/255 [Duration: %d ms]",
-                     target_idx + 1, actuator_gpios[target_idx], pwm_duty, duration_ms);
+            ESP_LOGI(TAG, "PWM: OUT%d (GPIO %d) -> Duty: %d/255 @ %u Hz [Duration: %d ms]",
+                     target_idx + 1, actuator_gpios[target_idx], pwm_duty,
+                     (unsigned)out_freq[target_idx], duration_ms);
         }
 
-        // 4. Arm auto-shutoff and acknowledge (with timing: arrival, switch, send)
+        // 5. Arm auto-shutoff and acknowledge (with timing: arrival, switch, send)
         cJSON *t0_item = cJSON_GetObjectItem(root, "t0");
         ack_timing_t tm = {
             .rx_ms  = rx_ms,
@@ -1957,6 +2068,7 @@ static void process_incoming_command(const char *json_string, size_t length, int
             .has_t0 = cJSON_IsNumber(t0_item),
             .t0     = cJSON_IsNumber(t0_item) ? t0_item->valuedouble : 0,
             .port   = target_idx + 1,
+            .freq   = is_binary ? 0 : (int)out_freq[target_idx],
         };
         if (actuator_active_state && duration_ms > 0) {
             if (arm_auto_shutoff(target_idx, duration_ms, cid_buf, tm.has_t0, tm.t0)) {
@@ -2119,7 +2231,8 @@ static void publish_node_config(void) {
         cJSON_AddNumberToObject(root, "prev_uptime_s", prev_uptime_s);
     }
     // Current output states, same field names as the actuate command:
-    // {"port":1,"mode":"bin","state":0} or {"port":2,"mode":"pwm","duty":128}.
+    // {"port":1,"mode":"bin","state":0,"freq":1000} or {"port":2,"mode":"pwm","duty":128,"freq":200}.
+    // freq = the PWM frequency the output's timer is set to (used in pwm mode).
     cJSON *outs = cJSON_AddArrayToObject(root, "outputs");
     for (int i = 0; i < NUM_ACTUATORS; i++) {
         cJSON *o = cJSON_CreateObject();
@@ -2131,6 +2244,7 @@ static void publish_node_config(void) {
             cJSON_AddStringToObject(o, "mode", "bin");
             cJSON_AddNumberToObject(o, "state", out_value[i]);
         }
+        cJSON_AddNumberToObject(o, "freq", out_freq[i]);
         cJSON_AddItemToArray(outs, o);
     }
     if (clock_trusted()) cJSON_AddNumberToObject(root, "ts", (double)node_epoch());
