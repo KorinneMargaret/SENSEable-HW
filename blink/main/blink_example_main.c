@@ -8,7 +8,7 @@
  * Revision 2026-10-23:
  *   - Atomic ADS1115 acquisition with OS-bit conversion polling
  *   - PGA +/-6.144 V (0-5 V sensors no longer clip above 4.096 V)
- *   - SNTP-disciplined timekeeping; DS3231 written back after every sync
+ *   - SNTP-disciplined timekeeping; DS3231 written back at the first sync, then at most hourly
  *   - Payload timestamps from the system clock (no I2C traffic per message)
  *   - Non-blocking MQTT publishing for telemetry, discovery and ACKs
  *   - Command execution moved out of the MQTT task; duplicate redelivery dropped
@@ -19,6 +19,10 @@
  * Revision 2026-11-20:
  *   - Per-output PWM frequency: optional "freq" (10-1000 Hz) on pwm actuate
  *     commands; each output has its own LEDC timer. Reported in config/ACKs.
+ *
+ * Revision 2026-11-27:
+ *   - Fault LED blinks slowly (1 Hz) while the I2C bus is held low
+ *   - Out-of-date comments corrected (DS3231 write-back, PWM limit)
  *
  * REQUIRED sdkconfig: CONFIG_FREERTOS_HZ=1000
  *   (menuconfig -> Component config -> FreeRTOS -> Kernel -> configTICK_RATE_HZ)
@@ -89,7 +93,8 @@ static const char *TAG = "THESIS_NODE";
 // SYSTEM LED INDICATORS & SWITCHES
 // ==========================================
 #define SYSTEM_LED_NET            14
-#define SYSTEM_LED_FAULT          23
+#define SYSTEM_LED_FAULT          23   // solid = no ADS1115 found; 1 Hz blink = I2C bus held;
+                                       // 5 Hz blink = unprovisioned (boot halt)
 #define PROVISION_SWITCH_GPIO     32   // Captive-portal provisioning switch
 
 // ==========================================
@@ -240,10 +245,13 @@ static const ledc_timer_t actuator_timers[NUM_ACTUATORS] = {
 #define ACTUATOR_LEDC_RES           LEDC_TIMER_8_BIT
 #define ACTUATOR_LEDC_FREQ          1000              // default (boot) frequency, Hz
 #define ACTUATOR_FREQ_MIN_HZ        10                // heaters/slow loads; lights flicker visibly this low
-// Upper limit set by the DRIVER BOARD, not the ESP32: its LTV-217 optocoupler and
-// 10k/100k gate resistors take tens of microseconds per switching edge, so above
-// ~1 kHz the MOSFET spends too long half-on (heat) and small/large duties distort.
-// Raise only for faster driver hardware, after checking the edges on a scope.
+// Upper limit set by the DRIVER BOARD, not the ESP32 (whose PWM measured accurate
+// to 1 kHz). Measured on the LTV-217 board (Nov 2026): the load stays on ~0.34 ms
+// past every off edge (slow gate discharge), so the duty at the load is about
+// 0.034 x Hz percentage points higher than commanded (+3 at 100 Hz, +34 at 1 kHz),
+// and commands above ~(100 - 0.034 x Hz)% leave the load fully on.
+// Still 1000 Hz until the group decides the cap (see the PWM findings document).
+// For faster driver hardware: raise only after checking duty and -Width at the load.
 #define ACTUATOR_FREQ_MAX_HZ        1000
 #define ACTUATOR_DUTY_FULL          (1 << 8)          // 2^res = true 100% (255 alone is 99.6%)
 
@@ -659,13 +667,28 @@ static void init_system_leds(void) {
     gpio_set_level(SYSTEM_LED_FAULT, 0);
 }
 
+// Defined with the I2C recovery code below; read here for the fault LED.
+static volatile bool bus_held;
+
 // Network LED: solid when MQTT is connected, 2 Hz blink when not.
-// (The fault LED is owned by the I2C scan: solid = no ADS1115 detected.)
+// Fault LED: normally owned by the I2C scan (solid = no ADS1115 detected). While
+// the bus is HELD (SDA/SCL stuck low) that scan does not run, so this task blinks
+// the fault LED at 1 Hz instead; before, it kept its old state and a held bus
+// (no sensors, no RTC) could look healthy.
 void network_led_task(void *pvParameter) {
     uint32_t tick = 0;
+    bool was_held = false;
     while (1) {
         tick++;
         gpio_set_level(SYSTEM_LED_NET, is_mqtt_connected ? 1 : (tick & 1));
+        if (bus_held) {
+            gpio_set_level(SYSTEM_LED_FAULT, (tick >> 1) & 1);   // 500 ms on, 500 ms off
+            was_held = true;
+        } else if (was_held) {
+            // Bus released: show the scan's state until its next pass updates it.
+            gpio_set_level(SYSTEM_LED_FAULT, (num_ads_found == 0) ? 1 : 0);
+            was_held = false;
+        }
         vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
@@ -798,7 +821,8 @@ static void report_previous_boot(void) {
 // Payload timestamps come from the system clock. The system clock is seeded
 // from the DS3231 at boot, disciplined by SNTP whenever a network is available,
 // and re-seeded from the DS3231 hourly when SNTP is not. The DS3231 is written
-// back after every SNTP sync so the correct time survives reboots and outages.
+// back at the first SNTP sync and then at most hourly (it drifts only ~2 ppm),
+// so the correct time survives reboots and outages.
 // Net effect: no I2C transaction per payload, no I2C access from the MQTT task,
 // and no bus traffic while a pod is being swapped.
 

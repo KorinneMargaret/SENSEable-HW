@@ -19,6 +19,12 @@ static httpd_handle_t portal_server = NULL;
 extern char node_id[32]; // Access the globally generated Node ID
 extern const char ntp_server_default[]; // NTP_SERVER_LOCAL from credentials.h (main file)
 
+// Stops phone keyboards from changing what is typed (auto-capitalising the first
+// letter, "correcting" words). SSIDs, passwords and tenant IDs are case-sensitive,
+// so an automatic edit made the node look for a network that doesn't exist.
+// Capitals typed on purpose are kept.
+#define NO_AUTO_FIX " autocapitalize=\"none\" autocorrect=\"off\" autocomplete=\"off\" spellcheck=\"false\""
+
 static const char *HTML_CONFIG_PAGE =
 "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
 "<style>"
@@ -59,45 +65,67 @@ static const char *HTML_CONFIG_PAGE =
 
 "<div id=\"wifi-fields\">"
 "<label>Wi-Fi SSID</label>"
-"<input type=\"text\" name=\"ssid\" placeholder=\"Wi-Fi Name\" value=\"%s\">"
+"<input type=\"text\" name=\"ssid\"" NO_AUTO_FIX " placeholder=\"Wi-Fi Name\" value=\"%s\">"
 "<label>Wi-Fi Password <span style=\"font-weight:normal;color:#718096;\">(Leave blank to keep current)</span></label>"
-"<input type=\"password\" name=\"pass\" placeholder=\"New Wi-Fi Password\">"
+"<input type=\"password\" name=\"pass\"" NO_AUTO_FIX " placeholder=\"New Wi-Fi Password\">"
 "</div>"
 
 "<div id=\"cell-fields\">"
 "<label>Cellular APN</label>"
-"<input type=\"text\" name=\"apn\" placeholder=\"e.g. internet.globe.com.ph\" value=\"%s\">"
+"<input type=\"text\" name=\"apn\"" NO_AUTO_FIX " placeholder=\"e.g. internet.globe.com.ph\" value=\"%s\">"
 "</div>"
 
 "<label>Edge Broker URI (Mosquitto)</label>"
-"<input type=\"text\" name=\"sec_uri\" placeholder=\"mqtts://...\" value=\"%s\" required>"
+"<input type=\"text\" name=\"sec_uri\"" NO_AUTO_FIX " placeholder=\"mqtts://...\" value=\"%s\" required>"
 "<label>Time Server <span style=\"font-weight:normal;color:#718096;\">(laptop IP; blank = %s)</span></label>"
-"<input type=\"text\" name=\"ntp_srv\" maxlength=\"63\" pattern=\"^[A-Za-z0-9.\\-]*$\" title=\"IP address or host name\" placeholder=\"%s\" value=\"%s\">"
+"<input type=\"text\" name=\"ntp_srv\"" NO_AUTO_FIX " maxlength=\"63\" pattern=\"^[A-Za-z0-9.\\-]*$\" title=\"IP address or host name\" placeholder=\"%s\" value=\"%s\">"
 "<label>Telemetry Interval (seconds) <span style=\"font-weight:normal;color:#718096;\">(5-3600; each reading = average over this time)</span></label>"
 "<input type=\"number\" name=\"tlm_s\" min=\"5\" max=\"3600\" step=\"1\" value=\"%lu\" required>"
 "<label>Tenant ID</label>"
-"<input type=\"text\" name=\"tenant_id\" pattern=\"^[a-z0-9]{2,12}-[a-f0-9]{4}$\" title=\"Must be in format e.g. llda-add4\" placeholder=\"e.g. llda-add4\" value=\"%s\" required>"
+"<input type=\"text\" name=\"tenant_id\"" NO_AUTO_FIX " pattern=\"^[a-z0-9]{2,12}-[a-f0-9]{4}$\" title=\"Must be in format e.g. llda-add4\" placeholder=\"e.g. llda-add4\" value=\"%s\" required>"
 
 "<button type=\"submit\">Save & Apply</button>"
 "</form></div></body></html>";
 
+// Shows what was ACTUALLY stored (read back from flash), so a typo or an
+// autocorrected SSID can be spotted before switching to Run Mode.
 static const char *HTML_SAVED_PAGE =
 "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
 "<style>body{font-family:sans-serif;text-align:center;padding:40px;background:#f0fff4;color:#22543d;}"
-".card{background:white;padding:30px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.08);max-width:380px;margin:auto;}</style></head><body>"
+".card{background:white;padding:30px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.08);max-width:380px;margin:auto;}"
+"a{color:#2b6cb0;}</style></head><body>"
 "<div class=\"card\"><h2>Configuration Saved!</h2>"
-"<div style=\"background:#e2e8f0;padding:12px;border-radius:6px;margin:15px 0;text-align:left;font-family:monospace;color:#2d3748;font-size:14px;\">"
-"<b>Node ID:</b> %s<br><b>Tenant ID:</b> %s"
+"<p style=\"margin:0;\">Check these settings before switching to Run Mode:</p>"
+"<div style=\"background:#e2e8f0;padding:12px;border-radius:6px;margin:15px 0;text-align:left;font-family:monospace;color:#2d3748;font-size:14px;word-break:break-all;\">"
+"<b>Node ID:</b> %s<br>"
+"<b>Tenant ID:</b> %s<br>"
+"<b>Mode:</b> %s<br>"
+"<b>%s:</b> &quot;%s&quot;<br>"
+"<b>Wi-Fi password:</b> %s<br>"
+"<b>Edge broker:</b> %s<br>"
+"<b>Time server:</b> %s<br>"
+"<b>Telemetry interval:</b> %lu s"
 "</div>"
-"<p>Credentials securely stored in flash.</p>"
+"<p>Something wrong? <a href=\"/\">Go back and edit</a>, then save again.</p>"
 "<p><b>Next Step:</b> Flip the slide switch back to <b>Run Mode</b> and press the Reset button.</p>"
 "</div></body></html>";
 
+// Captive-portal DNS: answers every A (IPv4) query with 192.168.4.1.
+// The reply is built from the 12-byte header plus the question only. The old
+// version copied the whole query (up to 128 bytes) into a 128-byte buffer and
+// appended 16 more bytes, so a long query overflowed the buffer; it also put
+// the answer after any extra records (EDNS) the phone sent, which made the
+// reply malformed. Questions of other types (e.g. AAAA/IPv6) get a valid empty
+// answer instead of an IPv4 address.
+#define DNS_MAX_LEN     512                 // classic DNS-over-UDP maximum
+#define DNS_HEADER_LEN  12
+#define DNS_ANSWER_LEN  16
+
 void dns_server_task(void *pvParameters) {
-    uint8_t rx_buffer[128];
-    uint8_t tx_buffer[128];
+    // static: keeps ~1 KB off this task's 3 KB stack (only this task uses them)
+    static uint8_t rx_buffer[DNS_MAX_LEN];
+    static uint8_t tx_buffer[DNS_MAX_LEN + DNS_ANSWER_LEN];
     struct sockaddr_in server_addr, client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0) { vTaskDelete(NULL); return; }
@@ -111,20 +139,73 @@ void dns_server_task(void *pvParameters) {
     }
 
     while (1) {
+        socklen_t client_addr_len = sizeof(client_addr);
         int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&client_addr, &client_addr_len);
-        if (len < 12) continue; 
-        memcpy(tx_buffer, rx_buffer, len);
-        tx_buffer[2] = 0x81; tx_buffer[3] = 0x80; tx_buffer[7] = 1;
-        int idx = len;
-        tx_buffer[idx++] = 0xC0; tx_buffer[idx++] = 0x0C;
-        tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x01; 
-        tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x01;
-        tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x00;
-        tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x3C; 
-        tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x04; 
-        tx_buffer[idx++] = 192;  tx_buffer[idx++] = 168; tx_buffer[idx++] = 4; tx_buffer[idx++] = 1;
+        if (len < DNS_HEADER_LEN) continue;
+
+        // Only standard queries (QR = 0, opcode 0) with at least one question.
+        if ((rx_buffer[2] & 0x80) || (rx_buffer[2] & 0x78)) continue;
+        if (rx_buffer[4] == 0 && rx_buffer[5] == 0) continue;
+
+        // Walk the first question's name (length-prefixed labels, ending in 0),
+        // never reading past what was received.
+        int pos = DNS_HEADER_LEN;
+        bool name_ok = false;
+        while (pos < len) {
+            uint8_t label = rx_buffer[pos];
+            if (label == 0) { pos++; name_ok = true; break; }
+            if (label & 0xC0) break;                 // compression pointer: not valid in a query name
+            pos += 1 + label;
+        }
+        if (!name_ok || pos + 4 > len) continue;     // also need QTYPE (2) + QCLASS (2)
+        uint16_t qtype  = (uint16_t)((rx_buffer[pos] << 8) | rx_buffer[pos + 1]);
+        uint16_t qclass = (uint16_t)((rx_buffer[pos + 2] << 8) | rx_buffer[pos + 3]);
+        int question_end = pos + 4;
+
+        // Header + question, copied as received (question_end <= len <= 512).
+        memcpy(tx_buffer, rx_buffer, question_end);
+        tx_buffer[2] = 0x81; tx_buffer[3] = 0x80;    // response, recursion desired/available, no error
+        tx_buffer[4] = 0;    tx_buffer[5] = 1;       // 1 question
+        tx_buffer[6] = 0;    tx_buffer[7] = 0;       // answers: set below
+        tx_buffer[8] = 0;    tx_buffer[9] = 0;       // no authority records
+        tx_buffer[10] = 0;   tx_buffer[11] = 0;      // no additional records (EDNS dropped)
+
+        int idx = question_end;
+        if (qtype == 1 && qclass == 1) {             // A record, Internet class
+            tx_buffer[7] = 1;
+            tx_buffer[idx++] = 0xC0; tx_buffer[idx++] = 0x0C;   // name: pointer to the question
+            tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x01;   // type A
+            tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x01;   // class IN
+            tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x00;
+            tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x3C;   // TTL 60 s
+            tx_buffer[idx++] = 0x00; tx_buffer[idx++] = 0x04;   // 4-byte address
+            tx_buffer[idx++] = 192;  tx_buffer[idx++] = 168; tx_buffer[idx++] = 4; tx_buffer[idx++] = 1;
+        }
         sendto(sock, tx_buffer, idx, 0, (struct sockaddr *)&client_addr, client_addr_len);
     }
+}
+
+// Escapes text for safe use inside HTML (including attribute values), so a
+// saved SSID or URI containing " < > & ' cannot break the setup page.
+static void html_escape(char *dst, size_t dst_size, const char *src) {
+    size_t d = 0;
+    if (dst_size == 0) return;
+    for (; src && *src; src++) {
+        const char *rep = NULL;
+        switch (*src) {
+            case '&':  rep = "&amp;";  break;
+            case '<':  rep = "&lt;";   break;
+            case '>':  rep = "&gt;";   break;
+            case '"':  rep = "&quot;"; break;
+            case '\'': rep = "&#39;";  break;
+            default: break;
+        }
+        size_t need = rep ? strlen(rep) : 1;
+        if (d + need >= dst_size) break;             // never cut an entity in half
+        if (rep) { memcpy(dst + d, rep, need); d += need; }
+        else     { dst[d++] = *src; }
+    }
+    dst[d] = '\0';
 }
 
 static void url_decode(char *dst, const char *src, size_t dst_size) {
@@ -173,27 +254,50 @@ static esp_err_t get_root_handler(httpd_req_t *req) {
         nvs_close(h);
     }
 
-    // Heap buffer for the dynamic HTML (page ~3.3 KB + field values)
-    char *resp_str = malloc(6144);
+    // Shown in the field: the saved server, else the built-in default
+    const char *ntp_shown = saved_ntp[0] ? saved_ntp : ntp_server_default;
+    const char *ntp_blank = ntp_server_default[0] ? ntp_server_default : "pool.ntp.org only";
+
+    // Escape every saved value before it goes into the page (worst case each
+    // character becomes 6, e.g. '"' -> "&quot;").
+    char *esc = malloc(64 * 6 * 4 + 128 * 6 + 32 * 6);   // ssid, apn, ntp x2 | uri | tenant
+    if (!esc) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    char *e_ssid   = esc;                 // 384
+    char *e_apn    = e_ssid  + 64 * 6;    // 384
+    char *e_uri    = e_apn   + 64 * 6;    // 768
+    char *e_blank  = e_uri   + 128 * 6;   // 384
+    char *e_shown  = e_blank + 64 * 6;    // 384
+    char *e_tenant = e_shown + 64 * 6;    // 192
+    html_escape(e_ssid,   64 * 6,  saved_ssid);
+    html_escape(e_apn,    64 * 6,  saved_apn);
+    html_escape(e_uri,    128 * 6, saved_uri);
+    html_escape(e_blank,  64 * 6,  ntp_blank);
+    html_escape(e_shown,  64 * 6,  ntp_shown);
+    html_escape(e_tenant, 32 * 6,  saved_tenant);
+
+    // Heap buffer for the dynamic HTML (page ~3.3 KB + escaped field values)
+    const size_t resp_size = 8192;
+    char *resp_str = malloc(resp_size);
     if (!resp_str) {
+        free(esc);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
     // Inject data into HTML variables
-    // Shown in the field: the saved server, else the built-in default
-    const char *ntp_shown = saved_ntp[0] ? saved_ntp : ntp_server_default;
-    const char *ntp_blank = ntp_server_default[0] ? ntp_server_default : "pool.ntp.org only";
-
-    snprintf(resp_str, 6144, HTML_CONFIG_PAGE,
-             mode == 0 ? "checked" : "",   
-             mode == 1 ? "checked" : "",   
-             saved_ssid,
-             saved_apn,
-             saved_uri,
-             ntp_blank, ntp_blank, ntp_shown,
+    snprintf(resp_str, resp_size, HTML_CONFIG_PAGE,
+             mode == 0 ? "checked" : "",
+             mode == 1 ? "checked" : "",
+             e_ssid,
+             e_apn,
+             e_uri,
+             e_blank, e_blank, e_shown,
              (unsigned long)(saved_tlm_ms / 1000),
-             saved_tenant);
+             e_tenant);
+    free(esc);
 
     httpd_resp_set_type(req, "text/html");
     esp_err_t res = httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
@@ -210,11 +314,21 @@ static esp_err_t captive_redirect_handler(httpd_req_t *req) {
 
 static esp_err_t post_save_handler(httpd_req_t *req) {
     char buf[768];
-    int ret, remaining = req->content_len;
-    if (remaining >= sizeof(buf)) { httpd_resp_send_500(req); return ESP_FAIL; }
-    ret = httpd_req_recv(req, buf, remaining);
-    if (ret <= 0) return ESP_FAIL;
-    buf[ret] = '\0';
+    size_t total = req->content_len;
+    if (total == 0 || total >= sizeof(buf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Form data empty or too long");
+        return ESP_FAIL;
+    }
+    // The form can arrive in more than one piece: keep reading until all of it
+    // is in. (One read used to drop whatever came after the first piece.)
+    size_t received = 0;
+    while (received < total) {
+        int ret = httpd_req_recv(req, buf + received, total - received);
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) continue;   // slow phone: wait for the rest
+        if (ret <= 0) return ESP_FAIL;                 // connection closed or error
+        received += (size_t)ret;
+    }
+    buf[received] = '\0';
 
     char raw_val[128];
     char clean_ssid[64] = {0}, clean_pass[64] = {0}, clean_sec_uri[128] = {0}, clean_tenant[32] = {0}, clean_apn[64] = {0};
@@ -279,14 +393,25 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
         if (!valid_tid) clean_tenant[0] = '\0'; // Nuke string if illegal chars bypass HTML
     }
 
-    nvs_handle_t h;
-    char final_tenant[32] = "UNREGISTERED";
+    // Values read back from flash after saving (on the heap: this handler
+    // already holds ~1.5 KB of buffers on the HTTP server task's stack).
+    typedef struct {
+        char tenant[32], ssid[64], apn[64], uri[128], ntp[64];
+        char e_tenant[32 * 6], e_ssid[64 * 6], e_apn[64 * 6], e_uri[128 * 6], e_ntp[64 * 6];
+    } saved_view_t;
+    saved_view_t *v = calloc(1, sizeof(saved_view_t));
+    if (!v) { httpd_resp_send_500(req); return ESP_FAIL; }
+    snprintf(v->tenant, sizeof(v->tenant), "UNREGISTERED");
+    uint8_t saved_mode = mode_val;
+    uint32_t saved_tlm_ms = 60000;
+    bool pass_changed = false;
 
+    nvs_handle_t h;
     if (nvs_open("senseable", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, "hw_mode", mode_val);
         
         if (strlen(clean_ssid) > 0) nvs_set_str(h, "wifi_ssid", clean_ssid);
-        if (strlen(clean_pass) > 0) nvs_set_str(h, "wifi_pass", clean_pass);
+        if (strlen(clean_pass) > 0) { nvs_set_str(h, "wifi_pass", clean_pass); pass_changed = true; }
         if (strlen(clean_apn) > 0) nvs_set_str(h, "cell_apn", clean_apn);
         if (strlen(clean_sec_uri) > 0) nvs_set_str(h, "sec_uri", clean_sec_uri);
         if (strlen(clean_tenant) > 0) nvs_set_str(h, "tenant_id", clean_tenant);
@@ -301,18 +426,45 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
         
         nvs_commit(h); 
         
-        // Read back the definitive tenant ID to display to the user
-        size_t len = sizeof(final_tenant);
-        nvs_get_str(h, "tenant_id", final_tenant, &len);
+        // Read back the definitive values to show the user
+        size_t len;
+        nvs_get_u8(h, "hw_mode", &saved_mode);
+        len = sizeof(v->tenant); nvs_get_str(h, "tenant_id", v->tenant, &len);
+        len = sizeof(v->ssid);   nvs_get_str(h, "wifi_ssid", v->ssid, &len);
+        len = sizeof(v->apn);    nvs_get_str(h, "cell_apn", v->apn, &len);
+        len = sizeof(v->uri);    nvs_get_str(h, "sec_uri", v->uri, &len);
+        len = sizeof(v->ntp);    nvs_get_str(h, "ntp_srv", v->ntp, &len);
+        // Same order the node uses at boot: remote value, else portal value, else 60 s
+        if (nvs_get_u32(h, "tlm_ms", &saved_tlm_ms) != ESP_OK) nvs_get_u32(h, "tlm_ms_p", &saved_tlm_ms);
         nvs_close(h);
         ESP_LOGI("PROVISION", "Credentials safely committed to NVS.");
     }
 
-    // Allocate buffer for success page injection
-    char *resp_str = malloc(2048);
-    if (!resp_str) { httpd_resp_send_500(req); return ESP_FAIL; }
-    
-    snprintf(resp_str, 2048, HTML_SAVED_PAGE, node_id, final_tenant);
+    bool cellular = (saved_mode == 1);
+    const char *ntp_shown = v->ntp[0] ? v->ntp
+                          : (ntp_server_default[0] ? ntp_server_default : "pool.ntp.org only");
+    html_escape(v->e_tenant, sizeof(v->e_tenant), v->tenant);
+    html_escape(v->e_ssid,   sizeof(v->e_ssid),   v->ssid);
+    html_escape(v->e_apn,    sizeof(v->e_apn),    v->apn);
+    html_escape(v->e_uri,    sizeof(v->e_uri),    v->uri[0] ? v->uri : "(not set)");
+    html_escape(v->e_ntp,    sizeof(v->e_ntp),    ntp_shown);
+
+    // Allocate buffer for success page injection (page ~1.6 KB + escaped values)
+    const size_t resp_size = 4096;
+    char *resp_str = malloc(resp_size);
+    if (!resp_str) { free(v); httpd_resp_send_500(req); return ESP_FAIL; }
+
+    snprintf(resp_str, resp_size, HTML_SAVED_PAGE,
+             node_id,
+             v->e_tenant,
+             cellular ? "Cellular" : "Wi-Fi",
+             cellular ? "Cellular APN" : "Wi-Fi SSID",
+             cellular ? v->e_apn : v->e_ssid,
+             pass_changed ? "changed (not shown)" : "unchanged (not shown)",
+             v->e_uri,
+             v->e_ntp,
+             (unsigned long)(saved_tlm_ms / 1000));
+    free(v);
 
     httpd_resp_set_type(req, "text/html");
     esp_err_t res = httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
